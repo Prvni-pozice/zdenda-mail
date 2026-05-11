@@ -163,6 +163,33 @@ def start_run(conn: sqlite3.Connection, command: str) -> int:
     return cur.lastrowid
 
 
+def record_action(
+    conn: sqlite3.Connection,
+    *,
+    message_id: int,
+    action_type: str,
+    target: str | None,
+    dry_run: bool,
+    success: bool | None = None,
+    error: str | None = None,
+) -> int:
+    """Zaloguj provedenou (nebo dry-run) IMAP akci do tabulky `actions`."""
+    cur = conn.execute(
+        "INSERT INTO actions (message_id, action_type, target, dry_run, success, error) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            message_id,
+            action_type,
+            target,
+            int(dry_run),
+            int(success) if success is not None else None,
+            error,
+        ],
+    )
+    assert cur.lastrowid is not None
+    return cur.lastrowid
+
+
 def finish_run(
     conn: sqlite3.Connection,
     run_id: int,

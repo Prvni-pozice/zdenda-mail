@@ -340,3 +340,174 @@ def test_categories_includes_spam() -> None:
 def test_sender_types_complete() -> None:
     for st in ("customer", "supplier", "bank", "marketing", "unknown"):
         assert st in classifier.SENDER_TYPES
+
+
+# ── save_human_label ───────────────────────────────────────────────────────────
+
+
+def test_save_human_label_creates_and_upserts(tmp_db: Path) -> None:
+    conn = db.connect(tmp_db)
+    try:
+        mid = _insert_msg(conn, uid=1)
+        with db.transaction(conn):
+            hl_id = classifier.save_human_label(conn, message_id=mid, category="invoice", note="OK")
+        assert hl_id > 0
+
+        row = conn.execute("SELECT category, note FROM human_labels WHERE id = ?", [hl_id]).fetchone()
+        assert row["category"] == "invoice"
+        assert row["note"] == "OK"
+
+        # Upsert — přepsat kategorii
+        with db.transaction(conn):
+            hl_id2 = classifier.save_human_label(conn, message_id=mid, category="spam")
+        assert hl_id2 == hl_id  # stejné id
+        row2 = conn.execute("SELECT category FROM human_labels WHERE id = ?", [hl_id]).fetchone()
+        assert row2["category"] == "spam"
+    finally:
+        conn.close()
+
+
+def test_save_human_label_rejects_unknown_category(tmp_db: Path) -> None:
+    conn = db.connect(tmp_db)
+    try:
+        mid = _insert_msg(conn, uid=1)
+        with pytest.raises(ValueError, match="kategorie"):
+            classifier.save_human_label(conn, message_id=mid, category="nonsense")
+    finally:
+        conn.close()
+
+
+# ── get_review_batch ───────────────────────────────────────────────────────────
+
+
+def test_get_review_batch_returns_classified(tmp_db: Path) -> None:
+    conn = db.connect(tmp_db)
+    try:
+        m1 = _insert_msg(conn, uid=1, offset_days=1)
+        m2 = _insert_msg(conn, uid=2, offset_days=2)
+
+        with db.transaction(conn):
+            pv = classifier.get_or_create_prompt_version(conn)
+            classifier.save_classification(conn, message_id=m1, prompt_version_id=pv,
+                                           category="invoice", confidence=0.95)
+            classifier.save_classification(conn, message_id=m2, prompt_version_id=pv,
+                                           category="spam", confidence=0.70)
+
+        items = classifier.get_review_batch(conn, prompt_version_id=pv, limit=10)
+        ids = [it["id"] for it in items]
+        assert m1 in ids and m2 in ids
+        # nejnižší confidence první
+        assert items[0]["confidence"] <= items[1]["confidence"]
+    finally:
+        conn.close()
+
+
+def test_get_review_batch_excludes_labeled(tmp_db: Path) -> None:
+    conn = db.connect(tmp_db)
+    try:
+        m1 = _insert_msg(conn, uid=1)
+        m2 = _insert_msg(conn, uid=2)
+
+        with db.transaction(conn):
+            pv = classifier.get_or_create_prompt_version(conn)
+            classifier.save_classification(conn, message_id=m1, prompt_version_id=pv,
+                                           category="spam", confidence=0.99)
+            classifier.save_classification(conn, message_id=m2, prompt_version_id=pv,
+                                           category="spam", confidence=0.80)
+            classifier.save_human_label(conn, message_id=m1, category="spam")
+
+        items = classifier.get_review_batch(conn, prompt_version_id=pv, limit=10, only_unlabeled=True)
+        assert [it["id"] for it in items] == [m2]
+    finally:
+        conn.close()
+
+
+def test_get_review_batch_category_filter(tmp_db: Path) -> None:
+    conn = db.connect(tmp_db)
+    try:
+        m1 = _insert_msg(conn, uid=1)
+        m2 = _insert_msg(conn, uid=2)
+
+        with db.transaction(conn):
+            pv = classifier.get_or_create_prompt_version(conn)
+            classifier.save_classification(conn, message_id=m1, prompt_version_id=pv,
+                                           category="invoice", confidence=0.9)
+            classifier.save_classification(conn, message_id=m2, prompt_version_id=pv,
+                                           category="spam", confidence=0.9)
+
+        items = classifier.get_review_batch(conn, prompt_version_id=pv, limit=10,
+                                            category="invoice", only_unlabeled=False)
+        assert len(items) == 1 and items[0]["id"] == m1
+    finally:
+        conn.close()
+
+
+# ── pending_apply ──────────────────────────────────────────────────────────────
+
+
+def test_pending_apply_excludes_moved(tmp_db: Path) -> None:
+    conn = db.connect(tmp_db)
+    try:
+        m1 = _insert_msg(conn, uid=1)
+        m2 = _insert_msg(conn, uid=2)
+
+        with db.transaction(conn):
+            pv = classifier.get_or_create_prompt_version(conn)
+            classifier.save_classification(conn, message_id=m1, prompt_version_id=pv,
+                                           category="invoice", confidence=0.9)
+            classifier.save_classification(conn, message_id=m2, prompt_version_id=pv,
+                                           category="spam", confidence=0.9)
+            db.record_action(conn, message_id=m1, action_type="move",
+                             target="_mail.Účetní", dry_run=False, success=True)
+
+        pending = classifier.pending_apply(conn, prompt_version_id=pv)
+        assert len(pending) == 1
+        assert pending[0]["id"] == m2
+    finally:
+        conn.close()
+
+
+def test_pending_apply_prefers_human_label(tmp_db: Path) -> None:
+    conn = db.connect(tmp_db)
+    try:
+        mid = _insert_msg(conn, uid=1)
+
+        with db.transaction(conn):
+            pv = classifier.get_or_create_prompt_version(conn)
+            classifier.save_classification(conn, message_id=mid, prompt_version_id=pv,
+                                           category="spam", confidence=0.9)
+            classifier.save_human_label(conn, message_id=mid, category="unimportant")
+
+        pending = classifier.pending_apply(conn, prompt_version_id=pv)
+        assert len(pending) == 1
+        assert pending[0]["final_category"] == "unimportant"
+        assert pending[0]["human_category"] == "unimportant"
+        assert pending[0]["cls_category"] == "spam"
+    finally:
+        conn.close()
+
+
+# ── export_training_data ───────────────────────────────────────────────────────
+
+
+def test_export_training_data_source_field(tmp_db: Path) -> None:
+    conn = db.connect(tmp_db)
+    try:
+        m1 = _insert_msg(conn, uid=1)
+        m2 = _insert_msg(conn, uid=2)
+
+        with db.transaction(conn):
+            pv = classifier.get_or_create_prompt_version(conn)
+            classifier.save_classification(conn, message_id=m1, prompt_version_id=pv,
+                                           category="invoice", confidence=0.95)
+            classifier.save_classification(conn, message_id=m2, prompt_version_id=pv,
+                                           category="spam", confidence=0.9)
+            classifier.save_human_label(conn, message_id=m1, category="invoice")
+
+        rows = classifier.export_training_data(conn, prompt_version_id=pv)
+        assert len(rows) == 2
+        by_id = {r["id"]: r for r in rows}
+        assert by_id[m1]["source"] == "human"
+        assert by_id[m2]["source"] == "claude"
+    finally:
+        conn.close()

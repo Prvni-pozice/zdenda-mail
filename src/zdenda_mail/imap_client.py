@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-from imap_tools import AND, MailBox, MailBoxUnencrypted
+from imap_tools import AND, MailBox, MailBoxUnencrypted, MailMessageFlags
 
 from .config import ImapConfig
 from .models import AttachmentMeta, MailMessage
@@ -128,6 +128,24 @@ def fetch_unseen(
     raw_msgs = raw_msgs[:limit]
 
     return [_to_mail_message(m, folder) for m in raw_msgs]
+
+
+def apply_move(
+    box: MailBox | MailBoxUnencrypted,
+    *,
+    folder: str,
+    uid: int,
+    target_folder: str,
+) -> None:
+    """Přesune zprávu bezpečnou sekvencí: COPY → \\Seen → DELETE.
+
+    COPY first — v případě selhání DELETe zpráva zůstane v originální složce.
+    \\Seen se nastavuje na zdroji, aby klient nepočítal přesunutý mail jako nepřečtený.
+    """
+    box.folder.set(folder)
+    box.copy([str(uid)], target_folder)
+    box.flag([str(uid)], [MailMessageFlags.SEEN], True)
+    box.delete([str(uid)])
 
 
 def ensure_folders(

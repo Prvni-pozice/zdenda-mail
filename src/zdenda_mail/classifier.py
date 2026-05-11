@@ -289,6 +289,228 @@ def stats(
     }
 
 
+def save_human_label(
+    conn: sqlite3.Connection,
+    *,
+    message_id: int,
+    category: str,
+    note: str | None = None,
+) -> int:
+    """Vlož nebo přepiš human label pro zprávu (ground truth pro trénink)."""
+    if category not in CATEGORIES:
+        raise ValueError(
+            f"Neznámá kategorie {category!r}. Povolené: {', '.join(CATEGORIES)}"
+        )
+    cur = conn.execute("SELECT 1 FROM messages WHERE id = ?", [message_id])
+    if cur.fetchone() is None:
+        raise ValueError(f"message_id={message_id} v DB neexistuje")
+
+    conn.execute(
+        "INSERT INTO human_labels (message_id, category, note) VALUES (?, ?, ?) "
+        "ON CONFLICT(message_id) DO UPDATE SET "
+        "category = excluded.category, note = excluded.note, "
+        "labeled_at = datetime('now')",
+        [message_id, category, note],
+    )
+    return int(
+        conn.execute(
+            "SELECT id FROM human_labels WHERE message_id = ?", [message_id]
+        ).fetchone()["id"]
+    )
+
+
+def get_review_batch(
+    conn: sqlite3.Connection,
+    *,
+    prompt_version_id: int,
+    limit: int = 20,
+    category: str | None = None,
+    max_confidence: float | None = None,
+    only_unlabeled: bool = True,
+) -> list[dict[str, Any]]:
+    """Klasifikované zprávy k human review, seřazené od nejnižší confidence.
+
+    CTE filtruje na `prompt_version_id` — v outer WHERE stačí volitelné podmínky.
+    """
+    conditions: list[str] = []
+    params: list[Any] = []
+
+    if category is not None:
+        conditions.append("lc.category = ?")
+        params.append(category)
+    if max_confidence is not None:
+        conditions.append("lc.confidence <= ?")
+        params.append(max_confidence)
+    if only_unlabeled:
+        conditions.append(
+            "NOT EXISTS (SELECT 1 FROM human_labels hl WHERE hl.message_id = m.id)"
+        )
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(limit)
+
+    cur = conn.execute(
+        f"""
+        WITH latest_cls AS (
+            SELECT message_id, id AS cls_id, category, confidence, reason, sender_type,
+                   ROW_NUMBER() OVER (PARTITION BY message_id ORDER BY created_at DESC) AS rn
+              FROM classifications
+             WHERE prompt_version_id = ?
+        )
+        SELECT m.id, m.uid, m.folder, m.from_addr, m.from_name,
+               m.subject, m.date_sent, m.body_text,
+               lc.cls_id, lc.category, lc.confidence, lc.reason, lc.sender_type
+          FROM messages m
+          JOIN latest_cls lc ON lc.message_id = m.id AND lc.rn = 1
+         {where}
+         ORDER BY lc.confidence ASC, m.date_sent ASC
+         LIMIT ?
+        """,
+        [prompt_version_id, *params],
+    )
+    rows = cur.fetchall()
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        body = r["body_text"] or ""
+        snippet = body[:400] + ("…" if len(body) > 400 else "")
+        out.append(
+            {
+                "id": r["id"],
+                "uid": r["uid"],
+                "folder": r["folder"],
+                "from_addr": r["from_addr"],
+                "from_name": r["from_name"],
+                "subject": r["subject"],
+                "date_sent": r["date_sent"],
+                "snippet": snippet,
+                "cls_id": r["cls_id"],
+                "category": r["category"],
+                "confidence": r["confidence"],
+                "reason": r["reason"],
+                "sender_type": r["sender_type"],
+            }
+        )
+    return out
+
+
+def pending_apply(
+    conn: sqlite3.Connection,
+    *,
+    prompt_version_id: int,
+) -> list[dict[str, Any]]:
+    """Zprávy s klasifikací, které ještě nebyly úspěšně přesunuty (action=move+success=1 chybí)."""
+    cur = conn.execute(
+        """
+        WITH latest_cls AS (
+            SELECT message_id, category, confidence,
+                   ROW_NUMBER() OVER (PARTITION BY message_id ORDER BY created_at DESC) AS rn
+              FROM classifications
+             WHERE prompt_version_id = ?
+        )
+        SELECT m.id, m.uid, m.folder,
+               COALESCE(hl.category, lc.category) AS final_category,
+               lc.category                          AS cls_category,
+               hl.category                          AS human_category,
+               lc.confidence
+          FROM messages m
+          JOIN latest_cls lc ON lc.message_id = m.id AND lc.rn = 1
+          LEFT JOIN human_labels hl ON hl.message_id = m.id
+         WHERE NOT EXISTS (
+               SELECT 1 FROM actions a
+                WHERE a.message_id = m.id
+                  AND a.action_type = 'move'
+                  AND a.success = 1
+         )
+         ORDER BY m.date_sent ASC
+        """,
+        [prompt_version_id],
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def export_training_data(
+    conn: sqlite3.Connection,
+    *,
+    prompt_version_id: int,
+    min_confidence: float = 0.0,
+    only_human: bool = False,
+    snippet_chars: int = 1000,
+) -> list[dict[str, Any]]:
+    """Export zpráv + klasifikací do seznamu dict pro JSONL trénink."""
+    conditions: list[str] = ["lc.prompt_version_id = ?"]
+    params: list[Any] = [prompt_version_id]
+
+    if min_confidence > 0.0:
+        conditions.append("lc.confidence >= ?")
+        params.append(min_confidence)
+    if only_human:
+        conditions.append("hl.id IS NOT NULL")
+
+    where = " AND ".join(conditions)
+
+    cur = conn.execute(
+        f"""
+        WITH latest_cls AS (
+            SELECT message_id, category, confidence, reason, sender_type,
+                   classified_by, prompt_version_id,
+                   ROW_NUMBER() OVER (PARTITION BY message_id ORDER BY created_at DESC) AS rn
+              FROM classifications
+        )
+        SELECT m.id, m.uid, m.folder, m.from_addr, m.from_name,
+               m.subject, m.date_sent, m.body_text, m.has_attachments,
+               lc.category    AS cls_category,
+               lc.confidence, lc.reason, lc.sender_type, lc.classified_by,
+               hl.category    AS human_category, hl.note AS human_note,
+               COALESCE(hl.category, lc.category) AS final_category,
+               p.version_tag
+          FROM messages m
+          JOIN latest_cls lc ON lc.message_id = m.id AND lc.rn = 1
+          JOIN prompt_versions p ON p.id = lc.prompt_version_id
+          LEFT JOIN human_labels hl ON hl.message_id = m.id
+         WHERE {where}
+         ORDER BY m.date_sent ASC
+        """,
+        params,
+    )
+    rows = cur.fetchall()
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        body = r["body_text"] or ""
+        snippet = body[:snippet_chars] + ("…" if len(body) > snippet_chars else "")
+
+        acur = conn.execute(
+            "SELECT filename, mime_type, size_bytes FROM attachments WHERE message_id = ?",
+            [r["id"]],
+        )
+        attachments = [dict(a) for a in acur.fetchall()]
+
+        out.append(
+            {
+                "id": r["id"],
+                "uid": r["uid"],
+                "folder": r["folder"],
+                "from_addr": r["from_addr"],
+                "from_name": r["from_name"],
+                "subject": r["subject"],
+                "date_sent": r["date_sent"],
+                "snippet": snippet,
+                "has_attachments": bool(r["has_attachments"]),
+                "attachments": attachments,
+                "category": r["final_category"],
+                "cls_category": r["cls_category"],
+                "human_category": r["human_category"],
+                "confidence": r["confidence"],
+                "reason": r["reason"],
+                "sender_type": r["sender_type"],
+                "source": "human" if r["human_category"] else "claude",
+                "version_tag": r["version_tag"],
+            }
+        )
+    return out
+
+
 def get_message_full(
     conn: sqlite3.Connection, *, message_id: int
 ) -> dict[str, Any] | None:

@@ -566,6 +566,360 @@ def show_cmd(
     console.print(Panel(body, title="Body (text)"))
 
 
+def _category_to_target(cfg, category: str) -> str | None:
+    """Mapuje klasifikační kategorii → IMAP složku z config.toml."""
+    mapping = {
+        "invoice": cfg.targets.invoices,
+        "important": cfg.targets.important_review,
+        "unimportant": cfg.targets.unimportant,
+        "spam": cfg.targets.spam,
+        "unsure": cfg.targets.unsure,
+    }
+    return mapping.get(category)
+
+
+@app.command("review")
+def review_cmd(
+    config: Path = typer.Option(
+        Path("./config.toml"), "--config", "-c", help="Cesta ke config.toml"
+    ),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max počet zpráv"),
+    category: str | None = typer.Option(
+        None, "--category", help="Filtruj kategorii (invoice, spam, ...)"
+    ),
+    max_confidence: float | None = typer.Option(
+        None, "--max-confidence", help="Horní hranice confidence (0.0–1.0)"
+    ),
+    all_msgs: bool = typer.Option(
+        False, "--all", help="Zobraz i již olabelované zprávy"
+    ),
+    prompt_version: str | None = typer.Option(
+        None, "--prompt-version", help="Default: aktuální v kódu"
+    ),
+) -> None:
+    """Interaktivní review klasifikací → ukládá opravy do human_labels.
+
+    Klávesy: Enter = potvrdit, <kategorie> = přepsat, s = přeskočit, q = konec.
+    """
+    _setup_logging()
+    cfg = load_config(config)
+    conn = _connect_db_or_exit(cfg)
+
+    try:
+        pv_id = _resolve_prompt_version(conn, prompt_version)
+        items = classifier.get_review_batch(
+            conn,
+            prompt_version_id=pv_id,
+            limit=limit,
+            category=category,
+            max_confidence=max_confidence,
+            only_unlabeled=not all_msgs,
+        )
+    except Exception as exc:
+        err_console.print(f"Chyba při načítání: {exc}")
+        conn.close()
+        raise typer.Exit(code=1)
+
+    if not items:
+        console.print("[green]Nic k review — vše je olabelováno (nebo filtr nic nevrátil).[/green]")
+        conn.close()
+        return
+
+    cats_hint = " | ".join(classifier.CATEGORIES)
+    console.rule(f"Review ({len(items)} zpráv, prompt {prompt_version or classifier.CURRENT_PROMPT_TAG})")
+
+    labeled = 0
+    skipped = 0
+
+    for i, item in enumerate(items):
+        console.rule(f"[{i + 1}/{len(items)}]")
+        lines = [
+            f"[bold]ID:[/bold] {item['id']}   [bold]Folder:[/bold] {item['folder']}",
+            f"[bold]From:[/bold] {item.get('from_name') or ''} <{item['from_addr']}>",
+            f"[bold]Date:[/bold] {item['date_sent'] or '—'}",
+            f"[bold]Subject:[/bold] {item['subject'] or '—'}",
+            f"[bold]Kategorie:[/bold] [yellow]{item['category']}[/yellow]   "
+            f"[bold]Confidence:[/bold] {item['confidence']:.2f}",
+        ]
+        if item.get("reason"):
+            lines.append(f"[bold]Reason:[/bold] {item['reason']}")
+        if item.get("sender_type"):
+            lines.append(f"[bold]Sender type:[/bold] {item['sender_type']}")
+        console.print(Panel("\n".join(lines), title="Klasifikace"))
+
+        if item.get("snippet"):
+            console.print(Panel(item["snippet"][:600], title="Snippet"))
+
+        console.print(
+            f"[dim]Kategorie: {cats_hint}[/dim]\n"
+            f"[dim][Enter] = potvrdit '{item['category']}' | <kategorie> = přepsat | s = přeskočit | q = konec[/dim]"
+        )
+
+        try:
+            answer = input("> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[yellow]Přerušeno.[/yellow]")
+            break
+
+        if answer == "q":
+            console.print("[yellow]Konec review.[/yellow]")
+            break
+        if answer == "s":
+            skipped += 1
+            continue
+
+        chosen = item["category"] if answer == "" else answer
+
+        if chosen not in classifier.CATEGORIES:
+            err_console.print(f"Neznámá odpověď: {answer!r}. Přeskočeno.")
+            skipped += 1
+            continue
+
+        note: str | None = None
+        if chosen != item["category"]:
+            console.print("[dim]Poznámka (volitelně, Enter = prázdné):[/dim]")
+            try:
+                note = input("  > ").strip() or None
+            except (EOFError, KeyboardInterrupt):
+                pass
+
+        try:
+            with db.transaction(conn):
+                classifier.save_human_label(conn, message_id=item["id"], category=chosen, note=note)
+            action = "potvrzen" if chosen == item["category"] else f"opraveno → {chosen}"
+            console.print(f"[green]✓[/green] {action}")
+            labeled += 1
+        except ValueError as exc:
+            err_console.print(f"Chyba: {exc}")
+            skipped += 1
+
+    conn.close()
+    console.rule("Souhrn review")
+    console.print(f"Olabelováno: [green]{labeled}[/green]   Přeskočeno: {skipped}")
+
+
+@app.command("apply")
+def apply_cmd(
+    config: Path = typer.Option(
+        Path("./config.toml"), "--config", "-c", help="Cesta ke config.toml"
+    ),
+    do_apply: bool = typer.Option(
+        False, "--apply", help="Skutečně přesunout (bez toho je dry-run)"
+    ),
+    prompt_version: str | None = typer.Option(
+        None, "--prompt-version", help="Default: aktuální v kódu"
+    ),
+    limit: int = typer.Option(0, "--limit", "-n", help="Max počet zpráv (0 = vše)"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Přesune klasifikované zprávy do cílových IMAP složek.
+
+    BEZPEČNOST: defaultně DRY-RUN — jen zobrazí co by se stalo.
+    Pro skutečný přesun přidej --apply.
+    Sekvence: COPY → \\\\Seen → DELETE (pokud COPY selže, original zůstane nedotčen).
+    """
+    _setup_logging(verbose=verbose)
+    cfg = load_config(config)
+
+    if not cfg.imap_user:
+        err_console.print("Chybí IMAP_USER. Vytvoř `.env` z `.env.example`.")
+        raise typer.Exit(code=2)
+
+    conn = _connect_db_or_exit(cfg)
+
+    try:
+        pv_id = _resolve_prompt_version(conn, prompt_version)
+        pending = classifier.pending_apply(conn, prompt_version_id=pv_id)
+    except Exception as exc:
+        err_console.print(f"Chyba: {exc}")
+        conn.close()
+        raise typer.Exit(code=1)
+
+    if not pending:
+        console.print("[green]Žádné zprávy čekající na přesun.[/green]")
+        conn.close()
+        return
+
+    if limit > 0:
+        pending = pending[:limit]
+
+    dry_run = not do_apply
+    mode_label = "[yellow]DRY-RUN[/yellow]" if dry_run else "[red]LIVE (--apply)[/red]"
+    console.rule(f"Apply — {mode_label} — {len(pending)} zpráv")
+
+    # Tabulka přehledu
+    table = Table(title="Plánované přesuny", show_lines=False)
+    table.add_column("ID", justify="right", style="cyan")
+    table.add_column("UID", justify="right")
+    table.add_column("Folder")
+    table.add_column("Kategorie", style="yellow")
+    table.add_column("Zdroj", style="dim")
+    table.add_column("→ Cíl")
+    for p in pending:
+        target = _category_to_target(cfg, p["final_category"]) or "??"
+        src = "human" if p["human_category"] else "claude"
+        table.add_row(
+            str(p["id"]), str(p["uid"]), p["folder"],
+            p["final_category"], src, target,
+        )
+    console.print(table)
+
+    if dry_run:
+        console.print("\n[dim]Dry-run — nic nebylo změněno. Spusť s --apply pro skutečný přesun.[/dim]")
+        conn.close()
+        return
+
+    # Skutečný přesun — potřebuje IMAP heslo
+    try:
+        password = getpass.getpass(f"IMAP heslo pro {cfg.imap_user}: ")
+    except (EOFError, KeyboardInterrupt):
+        err_console.print("Zrušeno.")
+        conn.close()
+        raise typer.Exit(code=130)
+
+    if not password:
+        err_console.print("Prázdné heslo — končím.")
+        conn.close()
+        raise typer.Exit(code=2)
+
+    moved = 0
+    errors = 0
+
+    try:
+        from .imap_client import apply_move
+        from imap_tools.errors import MailboxLoginError
+
+        try:
+            with open_mailbox(cfg.imap, cfg.imap_user, password) as box:
+                for p in pending:
+                    target = _category_to_target(cfg, p["final_category"])
+                    if target is None:
+                        err_console.print(
+                            f"  [red]msg {p['id']}[/red]: neznámá kategorie {p['final_category']!r}, přeskočeno."
+                        )
+                        errors += 1
+                        continue
+                    try:
+                        apply_move(box, folder=p["folder"], uid=p["uid"], target_folder=target)
+                        with db.transaction(conn):
+                            db.record_action(
+                                conn, message_id=p["id"], action_type="move",
+                                target=target, dry_run=False, success=True,
+                            )
+                        console.print(
+                            f"  [green]✓[/green] msg {p['id']} uid={p['uid']} → {target}"
+                        )
+                        moved += 1
+                    except Exception as exc:
+                        err_msg = str(exc)[:200]
+                        err_console.print(f"  [red]✗[/red] msg {p['id']}: {err_msg}")
+                        with db.transaction(conn):
+                            db.record_action(
+                                conn, message_id=p["id"], action_type="move",
+                                target=target, dry_run=False, success=False, error=err_msg,
+                            )
+                        errors += 1
+        except MailboxLoginError:
+            err_console.print("IMAP login selhal.")
+            raise typer.Exit(code=1)
+    finally:
+        password = "x" * len(password) if password else ""
+        del password
+        conn.close()
+
+    console.rule("Výsledek apply")
+    console.print(f"Přesunuto: [green]{moved}[/green]   Chyb: [red]{errors}[/red]")
+    if errors:
+        raise typer.Exit(code=1)
+
+
+@app.command("backup")
+def backup_cmd(
+    config: Path = typer.Option(
+        Path("./config.toml"), "--config", "-c", help="Cesta ke config.toml"
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o", help="Cesta k záložnímu .db souboru (default: <db>.bak)"
+    ),
+) -> None:
+    """Online záloha SQLite databáze (bezpečná i za běhu)."""
+    import sqlite3 as _sqlite3
+
+    _setup_logging()
+    cfg = load_config(config)
+
+    if not Path(cfg.db.path).is_file():
+        err_console.print(f"DB soubor neexistuje: {cfg.db.path}.")
+        raise typer.Exit(code=2)
+
+    backup_path = output or Path(cfg.db.path).with_suffix(".bak")
+
+    src = _sqlite3.connect(str(cfg.db.path))
+    dst = _sqlite3.connect(str(backup_path))
+    try:
+        src.backup(dst)
+        console.print(f"[green]✓[/green] Záloha uložena: [bold]{backup_path}[/bold]")
+    finally:
+        dst.close()
+        src.close()
+
+
+@app.command("export-training")
+def export_training_cmd(
+    config: Path = typer.Option(
+        Path("./config.toml"), "--config", "-c", help="Cesta ke config.toml"
+    ),
+    output: Path = typer.Option(
+        Path("./training.jsonl"), "--output", "-o", help="Výstupní JSONL soubor"
+    ),
+    prompt_version: str | None = typer.Option(
+        None, "--prompt-version", help="Default: aktuální v kódu"
+    ),
+    min_confidence: float = typer.Option(
+        0.0, "--min-confidence", help="Minimální confidence (0.0 = vše)"
+    ),
+    only_human: bool = typer.Option(
+        False, "--only-human", help="Jen zprávy s human_labels (ground truth)"
+    ),
+) -> None:
+    """Export zpráv + klasifikací do JSONL pro trénink / fine-tuning.
+
+    Každý řádek = jeden mail ve formátu JSON. Pole `source` = human | claude.
+    Human label má přednost před Claude klasifikací v poli `category`.
+    """
+    _setup_logging()
+    cfg = load_config(config)
+    conn = _connect_db_or_exit(cfg)
+
+    try:
+        pv_id = _resolve_prompt_version(conn, prompt_version)
+        rows = classifier.export_training_data(
+            conn,
+            prompt_version_id=pv_id,
+            min_confidence=min_confidence,
+            only_human=only_human,
+        )
+    finally:
+        conn.close()
+
+    if not rows:
+        console.print("[yellow]Žádná data k exportu (zkontroluj filtry).[/yellow]")
+        return
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+
+    human_count = sum(1 for r in rows if r["source"] == "human")
+    claude_count = len(rows) - human_count
+    console.rule("Export hotov")
+    console.print(f"Soubor:      [bold]{output}[/bold]")
+    console.print(f"Řádků celkem: [bold]{len(rows)}[/bold]")
+    console.print(f"  human:     [green]{human_count}[/green]")
+    console.print(f"  claude:    {claude_count}")
+
+
 def main() -> None:
     """Entry point pro `python -m zdenda_mail` nebo `uv run zdenda-mail`."""
     app()
