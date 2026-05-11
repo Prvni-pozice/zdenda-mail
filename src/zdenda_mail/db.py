@@ -81,6 +81,18 @@ def from_json(value: str | None) -> Any:
 # ── Bezpečné batch operace ─────────────────────────────────────────────────────
 
 
+def _scrub_surrogates(value: Any) -> Any:
+    """Odstraní lone UTF-16 surrogates (D800-DFFF) z řetězců.
+
+    SQLite (resp. Python bindings) je odmítá. Vzniká z mailů s rozbitým
+    multibyte encoding, kde split utekl uprostřed znaku. `errors="replace"`
+    nahradí každý lone surrogate `?`, ostatní unicode zůstává.
+    """
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace").decode("utf-8")
+    return value
+
+
 def insert_message(conn: sqlite3.Connection, row: dict[str, Any]) -> int | None:
     """Vlož jeden mail. Vrátí `lastrowid` nebo `None`, pokud kombinace (uid, folder)
     už existuje (kolize na UNIQUE).
@@ -91,7 +103,8 @@ def insert_message(conn: sqlite3.Connection, row: dict[str, Any]) -> int | None:
     sql = (
         f"INSERT OR IGNORE INTO messages ({col_list}) VALUES ({placeholders})"
     )
-    cur = conn.execute(sql, [row[c] for c in cols])
+    values = [_scrub_surrogates(row[c]) for c in cols]
+    cur = conn.execute(sql, values)
     return cur.lastrowid if cur.rowcount > 0 else None
 
 
