@@ -209,7 +209,9 @@ def setup_folders_cmd(
         console.print(f"[dim]· existovalo:[/dim] {f}")
 
     console.print(
-        f"\n[bold]Hotovo[/bold] — vytvořeno {len(created)}, existovalo {len(existed)}."
+        f"\n[bold]Hotovo[/bold] — vytvořeno {len(created)}, existovalo {len(existed)}.\n"
+        f"[dim]Pokud složky v mailovém klientovi nevidíš, přihlas je ručně "
+        f"v jeho dialogu Subscribe folders / Spravovat odběry.[/dim]"
     )
 
 

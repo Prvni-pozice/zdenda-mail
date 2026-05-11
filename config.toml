@@ -8,12 +8,12 @@ inbox = "INBOX"
 fetch_folders = ["INBOX", "Junk"]
 
 [targets]
-# Cílové složky pro Fázi 4 (MOVE s --apply). Vše pod INBOX._mail.
+# Cílové složky pro Fázi 4 (MOVE s --apply). Top-level _mail.* (mimo INBOX).
 # Pozn.: 1pmail.cz IMAP používá hierarchický delimiter "." (ne "/").
-invoices         = "INBOX._mail.Účetní"
-unimportant      = "INBOX._mail.Archive"
-important_review = "INBOX._mail.Review"
-unsure           = "INBOX._mail.HITL"
+invoices         = "_mail.Účetní"
+unimportant      = "_mail.Archive"
+important_review = "_mail.Review"
+unsure           = "_mail.HITL"
 
 [batch]
 default_size = 50

@@ -131,14 +131,19 @@ def fetch_unseen(
 
 
 def ensure_folders(
-    box: MailBox | MailBoxUnencrypted, folders: list[str]
+    box: MailBox | MailBoxUnencrypted,
+    folders: list[str],
 ) -> tuple[list[str], list[str]]:
     """Vytvoří složky, které na serveru chybí.
 
-    Vrací `(created, already_existed)`. Pojmenování složek na IMAP serveru
-    používá hierarchický delimiter (typicky `/` nebo `.`) — používáme to,
-    jak je v konfiguraci (typicky `INBOX/_mail/Účetní`). `imap_tools.folder.create`
-    si delimiter přizpůsobí.
+    Vrací `(created, already_existed)`. Idempotentní — porovnává s aktuálním
+    seznamem na serveru (LIST "" "*").
+
+    Pozn.: SUBSCRIBE jsme dříve volali automaticky, ale na 1pmail.cz IMAP to
+    vedlo k nechtěnému vytváření duplicitních top-level složek (server měl
+    pravděpodobně problém s názvy obsahujícími diakritiku v subscribe). SUBSCRIBE
+    se proto neprovádí — pokud klient složky nezobrazuje, je třeba je přihlásit
+    ručně v něm.
     """
     existing = {f.name for f in box.folder.list()}
     created: list[str] = []
