@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Citlivá data — heslo se NIKDE neukládá, ale .env může obsahovat IMAP_USER
+.env
+
+# SQLite databáze (+ WAL, shared memory)
+*.db
+*.db-wal
+*.db-shm
+*.bak
+
+# IMAP zálohy
+*.mbox
+
+# Stažené přílohy (faktury) — drží se mimo Git
+invoices/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/

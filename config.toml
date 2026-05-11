@@ -1,0 +1,18 @@
+[imap]
+host = "imap.1pmail.cz"
+port = 993
+use_ssl = true
+inbox = "INBOX"
+
+[targets]
+invoices = "INBOX/Účetní"
+unimportant = "INBOX/Triage/Archive"
+important_review = "INBOX/Triage/Review"
+unsure = "INBOX/Triage/HITL"
+
+[batch]
+default_size = 50
+oldest_first = true
+
+[db]
+path = "./zdenda_mail.db"

@@ -1,0 +1,29 @@
+[project]
+name = "zdenda-mail"
+version = "0.1.0"
+description = "IMAP mail fetcher + classifier (Claude Code) s SQLite úložištěm pro fine-tuning data"
+readme = "README.md"
+authors = [
+    { name = "Prvni Pozice Bot", email = "bot@prvni-pozice.cz" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "imap-tools>=1.12.1",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.1",
+    "python-dotenv>=1.2.2",
+    "rich>=15.0.0",
+    "typer>=0.25.1",
+]
+
+[project.scripts]
+zdenda-mail = "zdenda_mail.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
