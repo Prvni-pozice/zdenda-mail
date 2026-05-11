@@ -90,12 +90,15 @@ def fetch_unseen(
 ) -> list[MailMessage]:
     """Stáhne nepřečtené zprávy z `folder` v daném počtu.
 
+    - Přepne aktivní složku přes `box.folder.set(folder)`.
     - `mark_seen=False` — server NEZMĚNÍ `\\Seen` flag.
     - `oldest_first=True` — řadí podle `date` ASC v Pythonu (IMAP `SEARCH` to
       negarantuje napříč servery).
     - `skip_uids` — UID už uložené v DB, přeskočí (idempotence).
     """
     skip = skip_uids or set()
+
+    box.folder.set(folder)
 
     raw_msgs: list = []
     for msg in box.fetch(AND(seen=False), mark_seen=False, bulk=True):
@@ -113,3 +116,25 @@ def fetch_unseen(
     raw_msgs = raw_msgs[:limit]
 
     return [_to_mail_message(m, folder) for m in raw_msgs]
+
+
+def ensure_folders(
+    box: MailBox | MailBoxUnencrypted, folders: list[str]
+) -> tuple[list[str], list[str]]:
+    """Vytvoří složky, které na serveru chybí.
+
+    Vrací `(created, already_existed)`. Pojmenování složek na IMAP serveru
+    používá hierarchický delimiter (typicky `/` nebo `.`) — používáme to,
+    jak je v konfiguraci (typicky `INBOX/_mail/Účetní`). `imap_tools.folder.create`
+    si delimiter přizpůsobí.
+    """
+    existing = {f.name for f in box.folder.list()}
+    created: list[str] = []
+    skipped: list[str] = []
+    for f in folders:
+        if f in existing:
+            skipped.append(f)
+            continue
+        box.folder.create(f)
+        created.append(f)
+    return created, skipped

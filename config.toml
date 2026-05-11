@@ -3,12 +3,16 @@ host = "imap.1pmail.cz"
 port = 993
 use_ssl = true
 inbox = "INBOX"
+# Složky, ze kterých se čte při `fetch` (pořadí = priorita).
+# Junk je důležitý — slouží jako trénovací data pro spam klasifikaci.
+fetch_folders = ["INBOX", "Junk"]
 
 [targets]
-invoices = "INBOX/Účetní"
-unimportant = "INBOX/Triage/Archive"
-important_review = "INBOX/Triage/Review"
-unsure = "INBOX/Triage/HITL"
+# Cílové složky pro Fázi 4 (MOVE s --apply). Vše pod INBOX/_mail/.
+invoices         = "INBOX/_mail/Účetní"
+unimportant      = "INBOX/_mail/Archive"
+important_review = "INBOX/_mail/Review"
+unsure           = "INBOX/_mail/HITL"
 
 [batch]
 default_size = 50

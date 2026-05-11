@@ -14,6 +14,9 @@ class ImapConfig(BaseModel):
     port: int = 993
     use_ssl: bool = True
     inbox: str = "INBOX"
+    # Složky, ze kterých se čte při `fetch` (defaultně jen `inbox`).
+    # Junk se přidává proto, aby spam fungoval jako trénovací data.
+    fetch_folders: list[str] = Field(default_factory=lambda: ["INBOX"])
 
 
 class TargetsConfig(BaseModel):

@@ -29,13 +29,14 @@ console = Console()
 
 @dataclass
 class FetchStats:
-    """Výsledek běhu."""
+    """Výsledek běhu (agregát napříč všemi složkami)."""
 
     fetched: int = 0
     inserted: int = 0
     skipped_existing: int = 0
     errors: int = 0
     last_uid: int | None = None
+    per_folder: dict[str, dict[str, int]] | None = None
 
 
 def run_fetch(
@@ -44,9 +45,16 @@ def run_fetch(
     *,
     batch: int,
     dry_run: bool = False,
+    folders: list[str] | None = None,
 ) -> FetchStats:
-    """Stáhni `batch` nepřečtených, ulož do DB. Heslo dostane jen jednou."""
-    stats = FetchStats()
+    """Stáhni `batch` nepřečtených z každé složky v `folders`, ulož do DB.
+
+    - `folders` defaultně z `cfg.imap.fetch_folders` (typicky `INBOX` + `Junk`).
+    - `batch` se aplikuje **per složka** (ne celkově).
+    - Heslo dostane jen jednou, dál se k němu nevracíme.
+    """
+    folders = folders or cfg.imap.fetch_folders or [cfg.imap.inbox]
+    stats = FetchStats(per_folder={})
 
     # Connect k DB (i v dry-run režimu, abychom věděli, co skipnout)
     conn = db.connect(cfg.db.path)
@@ -54,31 +62,45 @@ def run_fetch(
 
     if not dry_run:
         with db.transaction(conn):
-            run_id = db.start_run(conn, command=f"fetch --batch {batch}")
-
-    try:
-        # Existing UIDs pro idempotenci
-        from_db_max = db.get_last_uid(conn, cfg.imap.inbox)
-
-        with open_mailbox(cfg.imap, cfg.imap_user, password) as box:
-            messages = fetch_unseen(
-                box,
-                folder=cfg.imap.inbox,
-                limit=batch,
-                skip_uids=_known_uids(conn, cfg.imap.inbox),
-                oldest_first=cfg.batch.oldest_first,
+            run_id = db.start_run(
+                conn, command=f"fetch --batch {batch} folders={','.join(folders)}"
             )
 
-        stats.fetched = len(messages)
-        if not messages:
+    try:
+        with open_mailbox(cfg.imap, cfg.imap_user, password) as box:
+            all_messages: list[MailMessage] = []
+            for folder in folders:
+                last_uid_in_db = db.get_last_uid(conn, folder)
+                try:
+                    folder_messages = fetch_unseen(
+                        box,
+                        folder=folder,
+                        limit=batch,
+                        skip_uids=_known_uids(conn, folder),
+                        oldest_first=cfg.batch.oldest_first,
+                    )
+                except Exception as e:
+                    stats.errors += 1
+                    logger.exception("Chyba při fetch ze složky %r: %s", folder, e)
+                    console.print(f"[red]Chyba u složky {folder}: {e}[/red]")
+                    continue
+
+                stats.per_folder[folder] = {
+                    "fetched": len(folder_messages),
+                    "last_uid_in_db": last_uid_in_db or 0,
+                }
+                all_messages.extend(folder_messages)
+
+            stats.fetched = len(all_messages)
+
+        if not all_messages:
             console.print(
-                f"[yellow]Žádné nové nepřečtené maily ve {cfg.imap.inbox}[/yellow] "
-                f"(poslední uložené UID: {from_db_max or '—'})"
+                f"[yellow]Žádné nové nepřečtené maily v žádné z {folders}[/yellow]"
             )
             return stats
 
         if dry_run:
-            _print_dry_run_preview(messages)
+            _print_dry_run_preview(all_messages)
             return stats
 
         with Progress(
@@ -89,10 +111,10 @@ def run_fetch(
             TimeElapsedColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task("Ukládám do DB", total=len(messages))
+            task = progress.add_task("Ukládám do DB", total=len(all_messages))
 
             with db.transaction(conn):
-                for msg in messages:
+                for msg in all_messages:
                     try:
                         msg_id = db.insert_message(conn, msg.to_db_row())
                         if msg_id is None:
@@ -138,6 +160,7 @@ def _print_dry_run_preview(messages: list[MailMessage]) -> None:
     from rich.table import Table
 
     table = Table(title="[DRY-RUN] Maily, které by se uložily", show_lines=False)
+    table.add_column("Folder", style="magenta")
     table.add_column("UID", justify="right", style="cyan")
     table.add_column("Date", style="dim")
     table.add_column("From", overflow="fold")
@@ -146,6 +169,7 @@ def _print_dry_run_preview(messages: list[MailMessage]) -> None:
 
     for m in messages:
         table.add_row(
+            m.folder,
             str(m.uid),
             (m.date_sent.isoformat() if m.date_sent else "—")[:19],
             (m.from_addr or "")[:60],
