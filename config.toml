@@ -14,6 +14,8 @@ invoices         = "_mail.Účetní"
 unimportant      = "_mail.Archive"
 important_review = "_mail.Review"
 unsure           = "_mail.HITL"
+# Zjevný spam — server-side spam složka (UŽ existuje, nevyrábíme).
+spam             = "Junk"
 
 [batch]
 default_size = 50

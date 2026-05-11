@@ -70,16 +70,38 @@ V CLAUDE.md projektu (sekce níže) bude klasifikační instrukce — definice k
 - Export z `messages` + `classifications` + `human_labels` do JSONL.
 - CLI: `zdenda-mail export-training --output training.jsonl`
 
-## Klasifikační instrukce (PLACEHOLDER — doplníme v Fázi 2)
+## Klasifikační instrukce
 
-Aktuálně prázdné. Až ve Fázi 2 sem přibyde:
+Aktuální verze: **`v1-conservative-2026-05-11`** (text je v `src/zdenda_mail/classifier.py` jako `PROMPT_V1`).
 
-- Definice kategorií: `invoice` | `important` | `unimportant` | `unsure`
-- Whitelist odesílatelů, kterým automaticky věřit
-- Konzervativní bias (pokud nejistý → `unsure`, ne `unimportant`)
-- Few-shot příklady (po validaci ručních labelů z `human_labels`)
+Zrcadleno tady pro lidské čtení — kanonický zdroj je kód (z něj se seeduje do `prompt_versions`).
 
-Verze instrukcí se snapshotuje do tabulky `prompt_versions` (`version_tag` + `instructions`) — každá klasifikace se odkazuje na konkrétní verzi.
+### Kategorie
+
+- `invoice` → `_mail.Účetní` — JAKÝKOLIV doklad za platbu (i zálohová/proforma, výzva, upomínka).
+- `important` → `_mail.Review` — vyžaduje reakci majitele (zákazník, dodavatel, banka, úřad, doména/hosting, osobní).
+- `unimportant` → `_mail.Archive` — marketing legitimní firmy, automaty, notifikace, statistiky.
+- `spam` → `Junk` — JEDNOZNAČNÝ scam/podvod (Viagra, „rychlé zbohatnutí", nigerijský princ, krypto scamy, phishing).
+- `unsure` → `_mail.HITL` — nelze rozhodnout / `confidence < 0.7`.
+
+### Bias
+
+- Konzervativní: nejistota mezi `important`/`unimportant` → `unsure`.
+- `confidence < 0.7` → `unsure` (override).
+- Faktura má prioritu nad subjectem.
+- `spam` pouze pro evidentní scam, ne pro otravný legit marketing.
+
+### Sender types
+
+`customer | supplier | bank | gov | service | marketing | personal | unknown`
+
+### Whitelist
+
+Zatím prázdný — doplní se z `human_labels` po Fázi 3.
+
+### Změna instrukcí
+
+Změna textu = **nový `version_tag`**. Stávající `prompt_versions` se nikdy nepřepisuje (audit klasifikací).
 
 ## Bezpečnostní constraints (NEPORUŠOVAT)
 

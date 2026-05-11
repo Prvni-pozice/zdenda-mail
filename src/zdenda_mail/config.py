@@ -24,6 +24,7 @@ class TargetsConfig(BaseModel):
     unimportant: str
     important_review: str
     unsure: str
+    spam: str = "Junk"
 
 
 class BatchConfig(BaseModel):
