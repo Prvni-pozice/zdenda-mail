@@ -112,7 +112,19 @@ def fetch_unseen(
             continue
         raw_msgs.append(msg)
 
-    raw_msgs.sort(key=lambda m: (m.date is None, m.date), reverse=not oldest_first)
+    # Sjednotit timezone — některé maily mají naive datetime (chybí TZ v hlavičce),
+    # jiné aware. Pro porovnání musíme mít všechny jednotně. Naive → považujeme za UTC.
+    from datetime import datetime, timezone
+
+    def _sort_key(m) -> tuple[int, datetime]:  # type: ignore[no-untyped-def]
+        d = m.date
+        if d is None:
+            return (1, datetime.min.replace(tzinfo=timezone.utc))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return (0, d)
+
+    raw_msgs.sort(key=_sort_key, reverse=not oldest_first)
     raw_msgs = raw_msgs[:limit]
 
     return [_to_mail_message(m, folder) for m in raw_msgs]
