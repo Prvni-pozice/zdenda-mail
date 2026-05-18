@@ -65,6 +65,15 @@ V CLAUDE.md projektu (sekce níže) bude klasifikační instrukce — definice k
 - Defaultně `--dry-run`. Bez `--apply` neudělá nic destruktivního.
 - Faktury: stáhne PDF přílohy do `./invoices/YYYY-MM/`, NEFORWARDUJE automaticky.
 
+### Server-side audit + reapply (v4)
+
+- `zdenda-mail audit-server [--output FILE]` — **read-only** porovnání server-side rozmístění vs. aktuální DB klasifikace. Skenuje všechny `_mail.*` + `INBOX` + `Junk`, vrací breakdown mismatchů (current → predicted). Volitelně uloží detail do JSON.
+- `zdenda-mail reapply [--apply] [--plan-output FILE]` — smíření server-side stavu s aktuální klasifikací. Default DRY-RUN. Pravidla:
+  - **Respektuje user manual moves**: pokud poslední `actions.target ≠ current_folder`, mail je tam, kam ho user dal → SKIP.
+  - **Žádný downgrade**: nepřesouvá ze známé `_mail.*` složky do `_mail.HITL` (unsure).
+  - Aplikuje: INBOX → predicted (standard apply), nebo state drift po reclassify (`last_action.target == current ≠ predicted`).
+  - `action_type='reapply'` v `actions` tabulce.
+
 ### Fáze 5 — Export pro učení (TBD)
 
 - Export z `messages` + `classifications` + `human_labels` do JSONL.
@@ -72,17 +81,35 @@ V CLAUDE.md projektu (sekce níže) bude klasifikační instrukce — definice k
 
 ## Klasifikační instrukce
 
-Aktuální verze: **`v1-conservative-2026-05-11`** (text je v `src/zdenda_mail/classifier.py` jako `PROMPT_V1`).
+Aktuální verze: **`v5-newsletter-cleanup-2026-05-14`** (kanonický zdroj: `src/zdenda_mail/rules.py`, funkce `classify(item)`).
 
-Zrcadleno tady pro lidské čtení — kanonický zdroj je kód (z něj se seeduje do `prompt_versions`).
+Historie verzí:
+- `v1-conservative-2026-05-11` (text v `classifier.py` jako `PROMPT_V1`)
+- `v2-subcategories-2026-05-12` — 7 podsložek unimportant
+- `v3-clients-2026-05-13` — kategorie `client` + `_mail.klienti`
+- `v4-rental-firma-2026-05-14` — kategorie `rental` (`_mail.Najmy`) a `firma_budova` (`_mail.Firma-budova`); přesun `hkpe.cz`/`hkjihlava.cz` z CLIENT_DOMAINS/IMPORTANT_DOMAINS → KOMORA_DOMAINS; cleanup duplicit (`vnd.cz` byl v obou CLIENT i IMPORTANT); řada sender corrections (DJI, Loxone, businessprofile-google, families-noreply-google, support@ppl.cz, airbnb discover přesunuty mezi kategoriemi).
+- `v5-newsletter-cleanup-2026-05-14` — vytřízdění 1019 nepřečtených HITL/Review. Nový "Exact-match overrides" blok v `classify()` (běží před IMPORTANT_DOMAINS suffix-matchem) — fix kolizí `prvni-pozice.com`, `collabim.cz`, `edc-cr.cz`. Rozšířené patterny: `egd.cz`/`dis.edc-cr.cz` (energie), `fio.cz` (banks), `airbnb`/`rcobchod`/`e-flypgs`/`cdkeysales` (eshops), `8020ai.co`/`mindvalley`/`deepstash`/`onedrive`/`capterra`/`complianz`/`claude.com`/`promotime`/`nascar`/`trademedia` (sw), `ppl.cz`/`balikovna.cz` (doprava). Nové spam patterny: `firezink.de`, `hymedimachinery.com`, `nextgroup.ge`. Aplikace: 587 přesunů, 0 chyb (1m 46s IMAP, 1.2s reclassify pro 8917 zpráv).
+- `v6-domeny-interni-retriage-2026-05-17` — nové kategorie `domeny` (`_mail.domeny`, notifikace registrátora `nic.cz`) a `interni` (`_mail.interni`, interní pošta `prvni-pozice.com`/`michalmartinek.cz`); re-triage složky Review (1176→419, 757 přesunů); `ortex.cz`/`karlova-pekarna.cz` přesunuty z IMPORTANT_DOMAINS do CLIENT_DOMAINS. Migrace `003`: `messages.current_folder/current_uid` (kde mail teď reálně leží) + tabulka `message_analysis` (obsahová vrstva — relationship, intent, summary, needs_reply, suggested_folder). Návrhy dalších kroků v `navrhy.md`.
 
-### Kategorie
+### Kategorie + subkategorie
 
 - `invoice` → `_mail.Účetní` — JAKÝKOLIV doklad za platbu (i zálohová/proforma, výzva, upomínka).
+- `rental` → `_mail.Najmy` — pošta od nájemníků a správce nemovitosti (`bytservis-ji.cz`, `peta9870@email.cz`). Kontroluje se PO invoice a PŘED client. (v4)
+- `firma_budova` → `_mail.Firma-budova` — cenové nabídky pro firmu/budovu (`fabrego.cz`, `flexibox.cz`, `zasklej.to`). Kontroluje se po rental, před client. (v4)
+- `domeny` → `_mail.domeny` — doménové notifikace registrátora (`nic.cz`): prodloužení, zrušení, změny, autorizační info. Automatické, ne osobní korespondence. (v6)
+- `interni` → `_mail.interni` — interní firemní pošta (`prvni-pozice.com`, `michalmartinek.cz`) — komunikace týmu. (v6)
+- `client` → `_mail.klienti` — mail od některé z ~532 klientských domén v `CLIENT_DOMAINS` (suffix-match). Kontroluje se PO `invoice/rental/firma_budova` a PŘED `important` — faktura od klienta jde do Účetní (reconciliation), ostatní pošta od klienta přeskakuje Review queue a jde rovnou do klientů.
 - `important` → `_mail.Review` — vyžaduje reakci majitele (zákazník, dodavatel, banka, úřad, doména/hosting, osobní).
-- `unimportant` → `_mail.Archive` — marketing legitimní firmy, automaty, notifikace, statistiky.
-- `spam` → `Junk` — JEDNOZNAČNÝ scam/podvod (Viagra, „rychlé zbohatnutí", nigerijský princ, krypto scamy, phishing).
-- `unsure` → `_mail.HITL` — nelze rozhodnout / `confidence < 0.7`.
+- `unimportant` → `_mail.unimportant` (s 7 podsložkami):
+  - `banks` → `_mail.unimportant.banks` — banky a spořitelny (ČS, ČSOB, mBank, Revolut, XTB, KB, ...)
+  - `energie` → `_mail.unimportant.energie` — energie a dobíjení (EON, ČEZ, EnelX, ChargePoint, PlugSurfing, Ionity, ...)
+  - `eshops` → `_mail.unimportant.eshops` — eshopy (Alza, Decathlon, IKEA, Datart, Notino, Netflix, Booking, Airbnb, ...)
+  - `develop` → `_mail.unimportant.develop` — dev nástroje (GitHub, GitLab, Docker, Vercel, Cloudflare, ...)
+  - `sw` → `_mail.unimportant.sw` — ostatní SaaS a marketing aplikace (Spotify, Adobe, PayPal, MailerLite, ...)
+  - `doprava` → `_mail.unimportant.doprava` — dopravci (DPD, PPL, FedEx, DHL)
+  - `komora` → `_mail.unimportant.komora` — hospodářská komora
+- `spam` → `Junk` — JEDNOZNAČNÝ scam/podvod + cold-B2B/výprodejové TLDs (.shop, .buzz, .za.com, .in.rs, .com.tr, czech-fake .eu domény).
+- `unsure` → `_mail.HITL` — nelze rozhodnout / `confidence < 0.7` / soft-spam TLDs (.pl/.ru/.ua/.cn/.tw/.de) bez automated patternu.
 
 ### Bias
 
@@ -95,13 +122,31 @@ Zrcadleno tady pro lidské čtení — kanonický zdroj je kód (z něj se seedu
 
 `customer | supplier | bank | gov | service | marketing | personal | unknown`
 
-### Whitelist
+### Whitelist a rulebook
 
-Zatím prázdný — doplní se z `human_labels` po Fázi 3.
+Kanonický zdroj pravidel: `src/zdenda_mail/rules.py`. Obsahuje:
+- `INVOICE_FROM_EXACT`, `INVOICE_FROM_CONTAINS` — známí dodavatelé fakturující
+- `RENTAL_FROM_EXACT`, `RENTAL_DOMAINS` — nájemníci + správa nemovitosti (v4)
+- `FIRMA_BUDOVA_FROM_EXACT`, `FIRMA_BUDOVA_DOMAINS` — cenové nabídky pro firmu/budovu (v4)
+- `CLIENT_DOMAINS` — ~532 klientských domén (v3-clients-2026-05-13), suffix-match
+- `IMPORTANT_DOMAINS`, `IMPORTANT_FROM_EXACT` — interní, govt, zákazníci (mimo CLIENT_DOMAINS), dodavatelé, osobní
+- 7 párů `{SUB}_FROM_EXACT` + `{SUB}_DOMAINS` pro podsložky unimportant
+- `COLD_SPAM_DOMAINS_RE`, `CZECH_FAKE_EU_DOMAINS`, `SPAM_TLDS_HARD`, `SPAM_TLDS_SOFT`
+- `SCAM_SUBJECTS`, `GIBBERISH_LOCAL_RE`, `FIRSTNAME_LASTNAME_RE`
+
+Když poznáš nový spam pattern nebo nového legit odesílatele, **uprav patterny v `rules.py`**, bump `PROMPT_VERSION` (např. `v2.1-...-2026-06-15`), a spusť `zdenda-mail reclassify --overwrite` pro reaplikaci.
+
+### Měsíční audit z Junku
+
+`zdenda-mail learn-from-junk --since-days 30` — vypíše top odesílatele z `Junk`, kteří nejsou pokrytí žádným patternem v `rules.py`. Workflow:
+1. Projdi top položky.
+2. Pokud opravdu spam → přidej do `COLD_SPAM_DOMAINS_RE` nebo `CZECH_FAKE_EU_DOMAINS`.
+3. Pokud false-positive → přidej do `IMPORTANT_DOMAINS` nebo do odpovídající unimportant podsložky.
+4. Bump `PROMPT_VERSION` a reclassify.
 
 ### Změna instrukcí
 
-Změna textu = **nový `version_tag`**. Stávající `prompt_versions` se nikdy nepřepisuje (audit klasifikací).
+Změna textu/pravidel = **nový `version_tag`**. Stávající `prompt_versions` se nikdy nepřepisuje (audit klasifikací).
 
 ## Bezpečnostní constraints (NEPORUŠOVAT)
 
@@ -146,6 +191,7 @@ zdenda-mail/
 ├── .env.example
 ├── .gitignore
 ├── migrations/001_init.sql
+├── migrations/002_subcategory.sql
 ├── src/zdenda_mail/
 │   ├── __init__.py
 │   ├── cli.py              # typer entry
@@ -153,6 +199,8 @@ zdenda-mail/
 │   ├── imap_client.py      # imap_tools wrapper
 │   ├── db.py               # sqlite3 + helpery
 │   ├── fetcher.py          # Fáze 1
+│   ├── classifier.py       # prompt v1 + DB helpery
+│   ├── rules.py            # KANONICKÝ rulebook v2 + classify()
 │   └── models.py           # pydantic schemas
 └── tests/test_fetcher.py
 ```

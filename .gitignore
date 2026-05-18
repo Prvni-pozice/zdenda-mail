@@ -16,7 +16,8 @@ wheels/
 *.db
 *.db-wal
 *.db-shm
-*.bak
+# zálohy DB — i varianty jako .bak-v4, .bak2, .bak-v6-pre
+*.bak*
 
 # IMAP zálohy
 *.mbox

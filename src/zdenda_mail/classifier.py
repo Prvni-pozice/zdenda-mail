@@ -14,7 +14,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-CATEGORIES = ("invoice", "important", "unimportant", "unsure", "spam")
+CATEGORIES = ("invoice", "client", "domeny", "interni", "rental", "firma_budova", "important", "unimportant", "unsure", "spam")
 SENDER_TYPES = (
     "customer",
     "supplier",
@@ -49,7 +49,7 @@ Tříděný účet: zdenek@prvni-pozice.com (Prvni-pozice s.r.o., majitel).
 
 - `unimportant` — automat, marketing, statistika, newsletter, „neotevřeli jste…",
   GitHub digest, social media notifikace, registrace cizích služeb, drobné
-  potvrzení o doručení. Cíl: `_mail.Archive`.
+  potvrzení o doručení. Cíl: `_mail.unimportant`.
 
 - `spam` — zjevný spam/scam: Viagra a podobné léky, „rychlé zbohatnutí",
   podvodné nabídky dědictví („nigerijský princ"), kryptoměnové scamy, fake
@@ -203,6 +203,7 @@ def save_classification(
     reason: str | None = None,
     sender_type: str | None = None,
     classified_by: str = "claude_code",
+    subcategory: str | None = None,
 ) -> int:
     """Vlož klasifikaci. Validuje kategorii, sender_type a rozsah `confidence`.
 
@@ -220,16 +221,14 @@ def save_classification(
             f"Neznámý sender_type {sender_type!r}. Povolené: {', '.join(SENDER_TYPES)}"
         )
 
-    # FK kontrola — pokud message_id neexistuje, INSERT shodí FK ON, takže
-    # není potřeba dvojí dotaz, ale chceme čitelnou hlášku:
     cur = conn.execute("SELECT 1 FROM messages WHERE id = ?", [message_id])
     if cur.fetchone() is None:
         raise ValueError(f"message_id={message_id} v DB neexistuje")
 
     cur = conn.execute(
         "INSERT INTO classifications "
-        "(message_id, prompt_version_id, category, confidence, reason, sender_type, classified_by) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "(message_id, prompt_version_id, category, confidence, reason, sender_type, classified_by, subcategory) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [
             message_id,
             prompt_version_id,
@@ -238,6 +237,7 @@ def save_classification(
             reason,
             sender_type,
             classified_by,
+            subcategory,
         ],
     )
     assert cur.lastrowid is not None
@@ -403,7 +403,7 @@ def pending_apply(
     cur = conn.execute(
         """
         WITH latest_cls AS (
-            SELECT message_id, category, confidence,
+            SELECT message_id, category, subcategory, confidence,
                    ROW_NUMBER() OVER (PARTITION BY message_id ORDER BY created_at DESC) AS rn
               FROM classifications
              WHERE prompt_version_id = ?
@@ -412,6 +412,7 @@ def pending_apply(
                COALESCE(hl.category, lc.category) AS final_category,
                lc.category                          AS cls_category,
                hl.category                          AS human_category,
+               lc.subcategory                       AS subcategory,
                lc.confidence
           FROM messages m
           JOIN latest_cls lc ON lc.message_id = m.id AND lc.rn = 1

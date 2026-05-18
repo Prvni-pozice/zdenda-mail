@@ -42,6 +42,13 @@ def _setup_logging(verbose: bool = False) -> None:
     )
 
 
+def _get_password(cfg) -> str:
+    """Vrátí IMAP_PASS z .env, nebo se zeptá interaktivně přes getpass."""
+    if cfg.imap_pass:
+        return cfg.imap_pass
+    return getpass.getpass(f"IMAP heslo pro {cfg.imap_user}: ")
+
+
 @app.command("init-db")
 def init_db_cmd(
     config: Path = typer.Option(
@@ -111,7 +118,7 @@ def fetch_cmd(
 
     # Heslo runtime, NIKDY nikde mimo paměť tohoto procesu.
     try:
-        password = getpass.getpass(f"IMAP heslo pro {cfg.imap_user}: ")
+        password = _get_password(cfg)
     except (EOFError, KeyboardInterrupt):
         err_console.print("Zrušeno uživatelem.")
         raise typer.Exit(code=130)
@@ -157,6 +164,145 @@ def fetch_cmd(
             )
 
 
+@app.command("fetch-sent")
+def fetch_sent_cmd(
+    config: Path = typer.Option(
+        Path("./config.toml"), "--config", "-c", help="Cesta ke config.toml"
+    ),
+    batch: int = typer.Option(
+        0,
+        "--batch",
+        "-n",
+        help="Max počet mailů k uložení (0 = vše)",
+    ),
+    folder: str | None = typer.Option(
+        None,
+        "--folder",
+        "-f",
+        help="Název Sent složky (override imap.sent_folder z configu)",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Stáhne VŠECHNY odeslané maily ze Sent složky a uloží do SQLite (messages tabulka).
+
+    Idempotentní — přeskočí UID, která jsou v DB. Spouštěj opakovaně pro přírůstkovou sync.
+    použitím Fáze 4 (MOVE operace). Heslo runtime přes `getpass.getpass()`.
+    """
+    from . import db as db_mod
+    from .imap_client import fetch_all_from_folder
+
+    _setup_logging(verbose=verbose)
+    cfg = load_config(config)
+
+    sent_folder = folder or cfg.imap.sent_folder
+
+    if not cfg.imap_user:
+        err_console.print("Chybí IMAP_USER — vytvoř `.env` ze `.env.example`.")
+        raise typer.Exit(code=2)
+
+    if not Path(cfg.db.path).is_file():
+        err_console.print(
+            f"DB soubor neexistuje: {cfg.db.path}. Spusť nejdříve `zdenda-mail init-db`."
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        password = _get_password(cfg)
+    except (EOFError, KeyboardInterrupt):
+        err_console.print("Zrušeno uživatelem.")
+        raise typer.Exit(code=130)
+
+    if not password:
+        err_console.print("Prázdné heslo — končím.")
+        raise typer.Exit(code=2)
+
+    conn = db_mod.connect(cfg.db.path)
+    inserted = skipped = errors = 0
+    last_uid: int | None = None
+
+    try:
+        with open_mailbox(cfg.imap, cfg.imap_user, password) as box:
+            password = "x" * len(password)
+            del password
+
+            skip_uids = {row["uid"] for row in conn.execute(
+                "SELECT uid FROM messages WHERE folder = ?", [sent_folder]
+            ).fetchall()}
+            console.print(
+                f"Složka [bold]{sent_folder}[/bold] — v DB: [cyan]{len(skip_uids)}[/cyan] UID, stahuji zbytek…"
+            )
+
+            msgs = fetch_all_from_folder(
+                box,
+                folder=sent_folder,
+                skip_uids=skip_uids,
+                oldest_first=True,
+                limit=batch if batch > 0 else None,
+            )
+
+        if not msgs:
+            console.print("[yellow]Žádné nové odeslané maily k uložení.[/yellow]")
+            return
+
+        console.print(f"Nalezeno nových: [bold]{len(msgs)}[/bold] — ukládám…")
+
+        from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+        with Progress(
+            SpinnerColumn(), TextColumn("{task.description}"),
+            BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Ukládám do DB", total=len(msgs))
+            with db_mod.transaction(conn):
+                for msg in msgs:
+                    try:
+                        msg_id = db_mod.insert_message(conn, msg.to_db_row())
+                        if msg_id is None:
+                            skipped += 1
+                        else:
+                            inserted += 1
+                            if msg.attachments:
+                                db_mod.insert_attachments(
+                                    conn, msg_id, [a.model_dump() for a in msg.attachments]
+                                )
+                            if last_uid is None or msg.uid > last_uid:
+                                last_uid = msg.uid
+                    except Exception as e:
+                        errors += 1
+                        logger.exception("Chyba u UID=%s: %s", msg.uid, e)
+                    progress.advance(task)
+
+    except MailboxLoginError:
+        err_console.print("IMAP login selhal: neplatný uživatel nebo heslo.")
+        raise typer.Exit(code=1)
+    except OSError as e:
+        err_console.print(f"Síťová chyba: {e}")
+        raise typer.Exit(code=1)
+    finally:
+        conn.close()
+
+    console.rule("Souhrn fetch-sent")
+    console.print(f"Uloženo:            [green]{inserted}[/green]")
+    console.print(f"Přeskočeno (dupe):  {skipped}")
+    if errors:
+        console.print(f"[red]Chyby: {errors}[/red]")
+    if last_uid is not None:
+        console.print(f"Poslední UID:       {last_uid}")
+
+    conn2 = db_mod.connect(cfg.db.path)
+    try:
+        r = conn2.execute(
+            "SELECT count(*) AS cnt, min(date_sent) AS oldest, max(date_sent) AS newest "
+            "FROM messages WHERE folder = ?", [sent_folder]
+        ).fetchone()
+        console.print(f"\n[bold]Celkem v DB (složka {sent_folder}):[/bold]")
+        console.print(f"  Počet mailů: [cyan]{r['cnt']}[/cyan]")
+        console.print(f"  Nejstarší:   {(r['oldest'] or '—')[:19]}")
+        console.print(f"  Nejnovější:  {(r['newest'] or '—')[:19]}")
+    finally:
+        conn2.close()
+
+
 @app.command("setup-folders")
 def setup_folders_cmd(
     config: Path = typer.Option(
@@ -177,7 +323,7 @@ def setup_folders_cmd(
         raise typer.Exit(code=2)
 
     try:
-        password = getpass.getpass(f"IMAP heslo pro {cfg.imap_user}: ")
+        password = _get_password(cfg)
     except (EOFError, KeyboardInterrupt):
         err_console.print("Zrušeno uživatelem.")
         raise typer.Exit(code=130)
@@ -193,6 +339,24 @@ def setup_folders_cmd(
         cfg.targets.unsure,
         cfg.targets.spam,
     ]
+    if cfg.targets.clients:
+        targets.append(cfg.targets.clients)
+    if cfg.targets.rentals:
+        targets.append(cfg.targets.rentals)
+    if cfg.targets.firma_budova:
+        targets.append(cfg.targets.firma_budova)
+    # Subkategorie unimportant (volitelné — pokud nejsou v config, vynech)
+    for sub in (
+        cfg.targets.unimportant_banks,
+        cfg.targets.unimportant_energie,
+        cfg.targets.unimportant_eshops,
+        cfg.targets.unimportant_develop,
+        cfg.targets.unimportant_sw,
+        cfg.targets.unimportant_doprava,
+        cfg.targets.unimportant_komora,
+    ):
+        if sub:
+            targets.append(sub)
 
     try:
         with open_mailbox(cfg.imap, cfg.imap_user, password) as box:
@@ -347,13 +511,16 @@ def save_classification_cmd(
     sender_type: str | None = typer.Option(
         None, "--sender-type", help=f"Volitelné. Jedna z: {', '.join(classifier.SENDER_TYPES)}"
     ),
+    subcategory: str | None = typer.Option(
+        None, "--subcategory", help="Subkategorie pro `unimportant` (banks/energie/eshops/develop/sw/doprava/komora)"
+    ),
     prompt_version: str | None = typer.Option(
         None, "--prompt-version", help="Default: aktuální verze v kódu"
     ),
     from_stdin: bool = typer.Option(
         False,
         "--stdin",
-        help="Čti JSON array `[{message_id, category, confidence, reason?, sender_type?}, …]` ze stdin",
+        help="Čti JSON array `[{message_id, category, confidence, reason?, sender_type?, subcategory?}, …]` ze stdin",
     ),
 ) -> None:
     """Ulož klasifikaci jedné zprávy, nebo batch přes `--stdin`."""
@@ -391,6 +558,7 @@ def save_classification_cmd(
                             confidence=float(item["confidence"]),
                             reason=item.get("reason"),
                             sender_type=item.get("sender_type"),
+                            subcategory=item.get("subcategory"),
                         )
                         saved += 1
                     except (KeyError, ValueError, TypeError) as e:
@@ -431,6 +599,7 @@ def save_classification_cmd(
                     confidence=float(confidence),  # type: ignore[arg-type]
                     reason=reason,
                     sender_type=sender_type,
+                    subcategory=subcategory,
                 )
         except ValueError as e:
             err_console.print(f"{e}")
@@ -566,10 +735,25 @@ def show_cmd(
     console.print(Panel(body, title="Body (text)"))
 
 
-def _category_to_target(cfg, category: str) -> str | None:
-    """Mapuje klasifikační kategorii → IMAP složku z config.toml."""
+def _category_to_target(cfg, category: str, subcategory: str | None = None) -> str | None:
+    """Mapuje (kategorie, subkategorie) → IMAP složku z config.toml.
+
+    Subkategorie se uplatní jen pro `unimportant` (banks/energie/eshops/develop/
+    sw/doprava/komora). Pokud subkategorie chybí nebo není v config, padá zpět
+    na top-level `_mail.unimportant`.
+    """
+    if category == "unimportant" and subcategory:
+        sub_attr = f"unimportant_{subcategory}"
+        sub_target = getattr(cfg.targets, sub_attr, None)
+        if sub_target:
+            return sub_target
     mapping = {
         "invoice": cfg.targets.invoices,
+        "client": cfg.targets.clients,
+        "domeny": cfg.targets.domeny,
+        "interni": cfg.targets.interni,
+        "rental": cfg.targets.rentals,
+        "firma_budova": cfg.targets.firma_budova,
         "important": cfg.targets.important_review,
         "unimportant": cfg.targets.unimportant,
         "spam": cfg.targets.spam,
@@ -756,11 +940,14 @@ def apply_cmd(
     table.add_column("Zdroj", style="dim")
     table.add_column("→ Cíl")
     for p in pending:
-        target = _category_to_target(cfg, p["final_category"]) or "??"
+        target = _category_to_target(cfg, p["final_category"], p.get("subcategory")) or "??"
         src = "human" if p["human_category"] else "claude"
+        cat_label = p["final_category"]
+        if p.get("subcategory"):
+            cat_label = f"{cat_label}/{p['subcategory']}"
         table.add_row(
             str(p["id"]), str(p["uid"]), p["folder"],
-            p["final_category"], src, target,
+            cat_label, src, target,
         )
     console.print(table)
 
@@ -771,7 +958,7 @@ def apply_cmd(
 
     # Skutečný přesun — potřebuje IMAP heslo
     try:
-        password = getpass.getpass(f"IMAP heslo pro {cfg.imap_user}: ")
+        password = _get_password(cfg)
     except (EOFError, KeyboardInterrupt):
         err_console.print("Zrušeno.")
         conn.close()
@@ -792,7 +979,7 @@ def apply_cmd(
         try:
             with open_mailbox(cfg.imap, cfg.imap_user, password) as box:
                 for p in pending:
-                    target = _category_to_target(cfg, p["final_category"])
+                    target = _category_to_target(cfg, p["final_category"], p.get("subcategory"))
                     if target is None:
                         err_console.print(
                             f"  [red]msg {p['id']}[/red]: neznámá kategorie {p['final_category']!r}, přeskočeno."
@@ -918,6 +1105,821 @@ def export_training_cmd(
     console.print(f"Řádků celkem: [bold]{len(rows)}[/bold]")
     console.print(f"  human:     [green]{human_count}[/green]")
     console.print(f"  claude:    {claude_count}")
+
+
+@app.command("reclassify")
+def reclassify_cmd(
+    config: Path = typer.Option(
+        Path("./config.toml"), "--config", "-c", help="Cesta ke config.toml"
+    ),
+    limit: int = typer.Option(0, "--limit", "-n", help="Max počet zpráv (0 = vše)"),
+    overwrite: bool = typer.Option(
+        False,
+        "--overwrite",
+        help="Reklasifikuj i ty, které už pro tuto prompt verzi mají záznam",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Spustí pravidlovou klasifikaci ze `rules.py` na všechny maily v DB.
+
+    Verze pravidel = `rules.PROMPT_VERSION`. Pokud `prompt_versions` ještě
+    nemá takový tag, založí se nový. Cíl: rychlá hromadná pre-klasifikace
+    bez nutnosti session-loop přes Claude Code.
+    """
+    from . import rules
+
+    _setup_logging(verbose=verbose)
+    cfg = load_config(config)
+    conn = _connect_db_or_exit(cfg)
+
+    try:
+        pv_id = classifier.get_or_create_prompt_version(
+            conn,
+            tag=rules.PROMPT_VERSION,
+            instructions=(
+                f"# Rule-based classifier {rules.PROMPT_VERSION}\n\n"
+                f"Kanonický zdroj: src/zdenda_mail/rules.py (funkce classify()).\n"
+                f"5 kategorií: invoice|important|unimportant|spam|unsure.\n"
+                f"7 podsložek pro unimportant: banks/energie/eshops/develop/sw/doprava/komora.\n"
+            ),
+            notes="Pravidlová verze — automaticky generovaná z rules.py",
+        )
+
+        if overwrite:
+            sql = """
+                SELECT id, folder, from_addr, subject, body_text
+                  FROM messages
+                 ORDER BY date_sent ASC
+            """
+            params: list = []
+        else:
+            sql = """
+                SELECT m.id, m.folder, m.from_addr, m.subject, m.body_text
+                  FROM messages m
+                 WHERE NOT EXISTS (
+                       SELECT 1 FROM classifications c
+                        WHERE c.message_id = m.id
+                          AND c.prompt_version_id = ?
+                 )
+                 ORDER BY m.date_sent ASC
+            """
+            params = [pv_id]
+
+        if limit > 0:
+            sql += " LIMIT ?"
+            params.append(limit)
+
+        rows = list(conn.execute(sql, params).fetchall())
+        if not rows:
+            console.print("[green]Nic k reklasifikaci.[/green]")
+            return
+
+        console.rule(f"Reclassify {len(rows)} zpráv — {rules.PROMPT_VERSION}")
+        stats_counter: dict[str, int] = {}
+
+        with db.transaction(conn):
+            for r in rows:
+                item = {
+                    "folder": r["folder"],
+                    "from_addr": r["from_addr"],
+                    "subject": r["subject"],
+                    "body_text": r["body_text"] or "",
+                }
+                result = rules.classify(item)
+                classifier.save_classification(
+                    conn,
+                    message_id=int(r["id"]),
+                    prompt_version_id=pv_id,
+                    category=result.category,
+                    confidence=result.confidence,
+                    reason=result.reason,
+                    sender_type=result.sender_type,
+                    classified_by="rule",
+                    subcategory=result.subcategory,
+                )
+                key = result.category + (f"/{result.subcategory}" if result.subcategory else "")
+                stats_counter[key] = stats_counter.get(key, 0) + 1
+
+        console.rule("Souhrn reclassify")
+        for k, v in sorted(stats_counter.items(), key=lambda x: -x[1]):
+            console.print(f"  {k:30s} {v}")
+    finally:
+        conn.close()
+
+
+@app.command("migrate-unimportant")
+def migrate_unimportant_cmd(
+    config: Path = typer.Option(
+        Path("./config.toml"), "--config", "-c", help="Cesta ke config.toml"
+    ),
+    do_apply: bool = typer.Option(
+        False, "--apply", help="Skutečně provést (bez toho je dry-run)"
+    ),
+    skip_rename: bool = typer.Option(
+        False, "--skip-rename", help="Přeskoč RENAME (pokud už `_mail.unimportant` existuje)"
+    ),
+    limit: int = typer.Option(0, "--limit", "-n", help="Max počet mailů (0 = vše)"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Migrace složky `_mail.Archive` → `_mail.unimportant` + rozdělení do 7 podsložek.
+
+    Jednorázový krok pro v2-subcategories. Sekvence:
+      1. RENAME `_mail.Archive` → `_mail.unimportant` (pokud existuje)
+      2. CREATE `_mail.unimportant.{banks|energie|eshops|develop|sw|doprava|komora}`
+      3. Pro každý mail s actions.target='_mail.unimportant' (success=1) a v2 sub:
+         - SEARCH v `_mail.unimportant` podle HEADER Message-ID
+         - MOVE do podsložky
+         - Zapsat novou akci `move-sub` do `actions`
+
+    Defaultně DRY-RUN.
+    """
+    from . import rules
+    from imap_tools import AND as IMAP_AND, H as IMAP_H
+
+    _setup_logging(verbose=verbose)
+    cfg = load_config(config)
+
+    if not cfg.imap_user:
+        err_console.print("Chybí IMAP_USER. Vytvoř `.env` z `.env.example`.")
+        raise typer.Exit(code=2)
+
+    conn = _connect_db_or_exit(cfg)
+
+    try:
+        pv_id = classifier.get_or_create_prompt_version(
+            conn,
+            tag=rules.PROMPT_VERSION,
+            instructions=(
+                f"# Rule-based classifier {rules.PROMPT_VERSION}\n\n"
+                f"Kanonický zdroj: src/zdenda_mail/rules.py (funkce classify()).\n"
+                f"5 kategorií: invoice|important|unimportant|spam|unsure.\n"
+                f"7 podsložek pro unimportant: banks/energie/eshops/develop/sw/doprava/komora.\n"
+            ),
+            notes="Pravidlová verze — automaticky generovaná z rules.py",
+        )
+
+        # Maily, které mají úspěšný move do _mail.unimportant a v2 subcategory
+        cur = conn.execute(
+            """
+            WITH latest_cls AS (
+                SELECT message_id, subcategory,
+                       ROW_NUMBER() OVER (PARTITION BY message_id ORDER BY created_at DESC) AS rn
+                  FROM classifications
+                 WHERE prompt_version_id = ?
+            )
+            SELECT m.id, m.message_id, m.from_addr, m.subject, lc.subcategory
+              FROM messages m
+              JOIN latest_cls lc ON lc.message_id = m.id AND lc.rn = 1
+             WHERE lc.subcategory IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM actions a
+                    WHERE a.message_id = m.id
+                      AND a.action_type = 'move'
+                      AND a.success = 1
+                      AND a.target = '_mail.unimportant'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM actions a2
+                    WHERE a2.message_id = m.id
+                      AND a2.action_type = 'move-sub'
+                      AND a2.success = 1
+               )
+             ORDER BY m.date_sent ASC
+            """,
+            [pv_id],
+        )
+        pending = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        err_console.print(f"DB chyba: {e}")
+        conn.close()
+        raise typer.Exit(code=1)
+
+    if limit > 0:
+        pending = pending[:limit]
+
+    dry = not do_apply
+    mode = "[yellow]DRY-RUN[/yellow]" if dry else "[red]LIVE (--apply)[/red]"
+    console.rule(f"Migrate unimportant — {mode} — {len(pending)} mailů k přesunu")
+
+    # Souhrn dle subkategorie
+    sub_count: dict[str, int] = {}
+    for p in pending:
+        sub_count[p["subcategory"]] = sub_count.get(p["subcategory"], 0) + 1
+    for k, v in sorted(sub_count.items(), key=lambda x: -x[1]):
+        target = _category_to_target(cfg, "unimportant", k)
+        console.print(f"  {k:10s} → {target:35s} {v}")
+
+    if dry:
+        console.print("\n[dim]Dry-run — nic se neděje. Spusť s --apply.[/dim]")
+        conn.close()
+        return
+
+    try:
+        password = _get_password(cfg)
+    except (EOFError, KeyboardInterrupt):
+        err_console.print("Zrušeno.")
+        conn.close()
+        raise typer.Exit(code=130)
+
+    if not password:
+        err_console.print("Prázdné heslo.")
+        conn.close()
+        raise typer.Exit(code=2)
+
+    UNIMPORTANT = "_mail.unimportant"
+    ARCHIVE = "_mail.Archive"
+
+    moved = 0
+    errors = 0
+    not_found = 0
+
+    try:
+        with open_mailbox(cfg.imap, cfg.imap_user, password) as box:
+            existing = {f.name for f in box.folder.list()}
+
+            # 1) RENAME _mail.Archive → _mail.unimportant
+            if not skip_rename:
+                if ARCHIVE in existing and UNIMPORTANT not in existing:
+                    console.print(f"[bold]RENAME[/bold] {ARCHIVE} → {UNIMPORTANT}")
+                    box.folder.rename(ARCHIVE, UNIMPORTANT)
+                elif UNIMPORTANT in existing:
+                    console.print(f"[dim]{UNIMPORTANT} už existuje — RENAME přeskočen.[/dim]")
+                else:
+                    err_console.print(f"[red]{ARCHIVE} neexistuje — nelze přejmenovat.[/red]")
+                    raise typer.Exit(code=1)
+                # Refresh
+                existing = {f.name for f in box.folder.list()}
+
+            # 2) CREATE 7 subfolderů
+            sub_folders = [
+                cfg.targets.unimportant_banks,
+                cfg.targets.unimportant_energie,
+                cfg.targets.unimportant_eshops,
+                cfg.targets.unimportant_develop,
+                cfg.targets.unimportant_sw,
+                cfg.targets.unimportant_doprava,
+                cfg.targets.unimportant_komora,
+            ]
+            for sf in sub_folders:
+                if sf and sf not in existing:
+                    box.folder.create(sf)
+                    console.print(f"  [green]✓ vytvořeno:[/green] {sf}")
+                elif sf:
+                    console.print(f"  [dim]· existuje:[/dim] {sf}")
+
+            # 3) MOVE mailů
+            box.folder.set(UNIMPORTANT)
+            from imap_tools import MailMessageFlags
+
+            for i, p in enumerate(pending, 1):
+                msg_id = p["message_id"]
+                sub = p["subcategory"]
+                target = _category_to_target(cfg, "unimportant", sub)
+                if not target or not msg_id:
+                    err_console.print(f"  [red]✗[/red] msg {p['id']}: chybí target nebo message_id")
+                    errors += 1
+                    continue
+
+                try:
+                    # Hledání podle Message-ID v aktuální složce
+                    found = list(box.fetch(IMAP_AND(header=IMAP_H("Message-ID", msg_id)),
+                                            mark_seen=False, bulk=False, limit=1))
+                    if not found:
+                        not_found += 1
+                        if verbose:
+                            console.print(f"  [yellow]?[/yellow] msg {p['id']} ({msg_id}): nenalezen v {UNIMPORTANT}")
+                        with db.transaction(conn):
+                            db.record_action(
+                                conn, message_id=p["id"], action_type="move-sub",
+                                target=target, dry_run=False, success=False,
+                                error="not found by Message-ID",
+                            )
+                        continue
+
+                    uid = found[0].uid
+                    box.copy([uid], target)
+                    box.flag([uid], [MailMessageFlags.SEEN], True)
+                    box.delete([uid])
+                    with db.transaction(conn):
+                        db.record_action(
+                            conn, message_id=p["id"], action_type="move-sub",
+                            target=target, dry_run=False, success=True,
+                        )
+                    moved += 1
+                    if verbose or i % 50 == 0:
+                        console.print(f"  [green]✓[/green] [{i}/{len(pending)}] msg {p['id']} → {target}")
+                except Exception as exc:
+                    err_msg = str(exc)[:200]
+                    err_console.print(f"  [red]✗[/red] msg {p['id']}: {err_msg}")
+                    with db.transaction(conn):
+                        db.record_action(
+                            conn, message_id=p["id"], action_type="move-sub",
+                            target=target, dry_run=False, success=False, error=err_msg,
+                        )
+                    errors += 1
+    except MailboxLoginError:
+        err_console.print("IMAP login selhal.")
+        raise typer.Exit(code=1)
+    finally:
+        password = "x" * len(password) if password else ""
+        del password
+        conn.close()
+
+    console.rule("Výsledek migrate-unimportant")
+    console.print(f"Přesunuto:    [green]{moved}[/green]")
+    console.print(f"Nenalezeno:   [yellow]{not_found}[/yellow]")
+    console.print(f"Chyb:         [red]{errors}[/red]")
+    if errors:
+        raise typer.Exit(code=1)
+
+
+@app.command("learn-from-junk")
+def learn_from_junk_cmd(
+    config: Path = typer.Option(
+        Path("./config.toml"), "--config", "-c", help="Cesta ke config.toml"
+    ),
+    since_days: int = typer.Option(
+        30, "--since-days", help="Kolik dní zpět hledat (default: 30)"
+    ),
+) -> None:
+    """Měsíční audit: ukáže nejčastější odesílatele z `Junk`, kteří nejsou v rules.py.
+
+    Doporučený workflow:
+    1. Spusť měsíčně.
+    2. Projdi top N domén v listu — pokud opravdu spam, přidej do rules.py
+       (COLD_SPAM_DOMAINS_RE, CZECH_FAKE_EU_DOMAINS, nebo SPAM_TLDS_HARD).
+    3. Pokud false-positive (legit firma) → přidej do IMPORTANT_DOMAINS nebo
+       odpovídající UNIMPORTANT podsložky.
+    4. Bump `rules.PROMPT_VERSION` (např. `v2.1-...-2026-06-15`) a `reclassify`.
+    """
+    from . import rules
+
+    _setup_logging()
+    cfg = load_config(config)
+    conn = _connect_db_or_exit(cfg)
+
+    try:
+        cur = conn.execute(
+            f"""
+            SELECT from_addr, count(*) AS n
+              FROM messages
+             WHERE folder = 'Junk'
+               AND date_sent >= datetime('now', '-{int(since_days)} days')
+             GROUP BY from_addr
+             ORDER BY n DESC
+            """
+        )
+        rows = list(cur.fetchall())
+
+        if not rows:
+            console.print(f"[yellow]Žádné Junk maily za posledních {since_days} dní.[/yellow]")
+            return
+
+        known_domains = (
+            rules.IMPORTANT_DOMAINS
+            | rules.BANKS_DOMAINS | rules.ENERGIE_DOMAINS | rules.ESHOPS_DOMAINS
+            | rules.DEVELOP_DOMAINS | rules.SW_DOMAINS | rules.DOPRAVA_DOMAINS
+            | rules.KOMORA_DOMAINS | rules.UNIMPORTANT_DOMAINS
+        )
+
+        table = Table(title=f"Top Junk odesílatelé za {since_days} dní (mimo rules.py)")
+        table.add_column("Count", justify="right")
+        table.add_column("From")
+        table.add_column("Domain")
+        table.add_column("Stav")
+
+        shown = 0
+        for r in rows:
+            addr = (r["from_addr"] or "").lower()
+            domain = addr.split("@", 1)[-1] if "@" in addr else ""
+            status = "známé pattern" if (domain in known_domains or rules._domain_match(domain, known_domains)) else "[red]NOVÉ[/red]"
+            if status == "známé pattern":
+                continue
+            table.add_row(str(r["n"]), addr, domain, status)
+            shown += 1
+            if shown >= 50:
+                break
+
+        console.print(table)
+        console.print(
+            f"\n[dim]Pokud nějaká doména patří mezi spam, přidej ji do rules.py "
+            f"(COLD_SPAM_DOMAINS_RE nebo CZECH_FAKE_EU_DOMAINS) a bump PROMPT_VERSION.[/dim]"
+        )
+    finally:
+        conn.close()
+
+
+def _normalize_message_id(mid: str | None) -> str | None:
+    """Normalizuj Message-ID: trim, oprav < > obálku, lowercase."""
+    if not mid:
+        return None
+    mid = mid.strip()
+    if mid.startswith("<") and mid.endswith(">"):
+        mid = mid[1:-1]
+    return mid.lower() or None
+
+
+def _scan_server_message_ids(box, folders: list[str]) -> dict[str, tuple[str, int]]:
+    """Naskenuje zadané IMAP složky a vrátí `Message-ID → (folder, uid)` mapu.
+
+    Načítá jen hlavičky (`headers_only=True`), bulk fetch pro rychlost,
+    `mark_seen=False`. Při kolizi posledni viděný folder vyhrává.
+    """
+    server_map: dict[str, tuple[str, int]] = {}
+    for folder in folders:
+        try:
+            box.folder.set(folder)
+        except Exception as exc:
+            err_console.print(f"  ! SET {folder}: {exc}")
+            continue
+        cnt = 0
+        for msg in box.fetch(
+            "ALL", mark_seen=False, bulk=True, headers_only=True, limit=None
+        ):
+            mid_raw = None
+            if msg.headers:
+                mid_raw = msg.headers.get("message-id", [None])[0]
+            mid = _normalize_message_id(mid_raw)
+            if mid:
+                server_map[mid] = (folder, int(msg.uid))
+                cnt += 1
+        console.print(f"  {folder:45s} {cnt:>6d}")
+    return server_map
+
+
+def _load_db_classifications(conn) -> list[dict]:
+    """Načti latest klasifikaci (per message) z DB."""
+    rows = conn.execute(
+        """
+        WITH latest AS (
+            SELECT message_id, category, subcategory,
+                   ROW_NUMBER() OVER (PARTITION BY message_id ORDER BY created_at DESC) rn
+              FROM classifications
+        )
+        SELECT m.id, m.message_id, m.from_addr, m.subject,
+               l.category, l.subcategory
+          FROM messages m
+          JOIN latest l ON l.message_id = m.id AND l.rn = 1
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _load_last_actions(conn) -> dict[int, str]:
+    """Načti poslední úspěšnou move/move-sub/reapply akci pro každý DB message id.
+
+    Vrátí mapu `db_message_id → target_folder`.
+    """
+    last_actions: dict[int, str] = {}
+    for r in conn.execute(
+        """
+        SELECT message_id, target
+          FROM actions
+         WHERE action_type IN ('move', 'move-sub', 'reapply')
+           AND success = 1
+           AND id IN (
+               SELECT MAX(id) FROM actions
+                WHERE action_type IN ('move', 'move-sub', 'reapply')
+                  AND success = 1
+                GROUP BY message_id
+           )
+        """
+    ):
+        last_actions[int(r["message_id"])] = r["target"]
+    return last_actions
+
+
+def _list_audit_folders(box) -> list[str]:
+    """Vrať seznam složek pro audit: všechny `_mail.*` + `INBOX` + `Junk`."""
+    all_folders = sorted(f.name for f in box.folder.list())
+    return [
+        f for f in all_folders
+        if f.startswith("_mail.") or f in ("INBOX", "Junk")
+    ]
+
+
+@app.command("audit-server")
+def audit_server_cmd(
+    config: Path = typer.Option(
+        Path("./config.toml"), "--config", "-c", help="Cesta ke config.toml"
+    ),
+    output: Path | None = typer.Option(
+        None, "--output", "-o",
+        help="Volitelný JSON soubor s detailním breakdownem mismatchů",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Read-only audit: porovná server-side rozmístění mailů vs. DB klasifikace.
+
+    Naskenuje všechny `_mail.*` + `INBOX` + `Junk`, pro každý mail s DB klasifikací
+    spočítá predicted target dle `rules.py` a nahlásí mismatche.
+    Žádné IMAP přesuny — jen reporting.
+    """
+    _setup_logging(verbose=verbose)
+    cfg = load_config(config)
+
+    if not cfg.imap_user:
+        err_console.print("Chybí IMAP_USER.")
+        raise typer.Exit(code=2)
+
+    conn = _connect_db_or_exit(cfg)
+
+    try:
+        password = _get_password(cfg)
+    except (EOFError, KeyboardInterrupt):
+        err_console.print("Zrušeno.")
+        conn.close()
+        raise typer.Exit(code=130)
+
+    if not password:
+        err_console.print("Prázdné heslo.")
+        conn.close()
+        raise typer.Exit(code=2)
+
+    try:
+        console.rule("Server snapshot")
+        with open_mailbox(cfg.imap, cfg.imap_user, password) as box:
+            folders = _list_audit_folders(box)
+            server_map = _scan_server_message_ids(box, folders)
+        console.print(f"\n  TOTAL Message-IDs: [bold]{len(server_map)}[/bold]")
+
+        console.rule("DB klasifikace")
+        db_rows = _load_db_classifications(conn)
+        console.print(f"  {len(db_rows)} klasifikovaných mailů")
+
+        last_actions = _load_last_actions(conn)
+
+        no_op = 0
+        not_on_server = 0
+        no_predicted = 0
+        mismatches: list[dict] = []
+
+        for r in db_rows:
+            predicted = _category_to_target(cfg, r["category"], r["subcategory"])
+            if not predicted:
+                no_predicted += 1
+                continue
+            mid = _normalize_message_id(r["message_id"])
+            if not mid or mid not in server_map:
+                not_on_server += 1
+                continue
+            current_folder, current_uid = server_map[mid]
+            if current_folder == predicted:
+                no_op += 1
+                continue
+            mismatches.append({
+                "db_id": int(r["id"]),
+                "msg_id": mid,
+                "from": r["from_addr"],
+                "subject": r["subject"],
+                "category": r["category"],
+                "subcategory": r["subcategory"],
+                "current": current_folder,
+                "uid": current_uid,
+                "predicted": predicted,
+                "last_action": last_actions.get(int(r["id"])),
+            })
+
+        console.rule("Souhrn")
+        console.print(f"NO-OP (už správně):     [green]{no_op}[/green]")
+        console.print(f"Mismatch (k přesunu):   [yellow]{len(mismatches)}[/yellow]")
+        console.print(f"Není na serveru:        {not_on_server}")
+        console.print(f"Bez target (skip):      {no_predicted}")
+
+        from collections import Counter
+        breakdown = Counter((m["current"], m["predicted"]) for m in mismatches)
+        console.rule("Breakdown current → predicted (top 30)")
+        for (cur, pred), n in breakdown.most_common(30):
+            console.print(f"  {n:>5d}  {cur:35s} → {pred}")
+
+        if output:
+            output.write_text(
+                json.dumps(mismatches, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            console.print(f"\nMismatches detail uložen do [bold]{output}[/bold]")
+    finally:
+        password = "x" * len(password) if password else ""
+        del password
+        conn.close()
+
+
+@app.command("reapply")
+def reapply_cmd(
+    config: Path = typer.Option(
+        Path("./config.toml"), "--config", "-c", help="Cesta ke config.toml"
+    ),
+    do_apply: bool = typer.Option(
+        False, "--apply", help="Skutečně přesunout (bez toho je dry-run)"
+    ),
+    plan_output: Path | None = typer.Option(
+        None, "--plan-output",
+        help="JSON soubor s naplánovanými přesuny (default: žádný)",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Re-apply: smíření server-side stavu s aktuální DB klasifikací.
+
+    Pravidla:
+      - **Respektuje user manual moves**: pokud poslední action.target ≠ current_folder,
+        user mail ručně přesunul → SKIP.
+      - **Žádný downgrade**: pokud predicted = `_mail.HITL` a current je specifická
+        složka, SKIP (nepřesouvat ze známé kategorie do unsure).
+      - Aplikuje: INBOX → predicted (standard apply), nebo state drift
+        (last_action.target == current ≠ predicted).
+
+    Defaultně DRY-RUN — pro skutečné provedení přidej `--apply`.
+    """
+    from imap_tools import AND as IMAP_AND, H as IMAP_H, MailMessageFlags
+
+    _setup_logging(verbose=verbose)
+    cfg = load_config(config)
+
+    if not cfg.imap_user:
+        err_console.print("Chybí IMAP_USER.")
+        raise typer.Exit(code=2)
+
+    hitl_folder = cfg.targets.unsure
+
+    conn = _connect_db_or_exit(cfg)
+
+    try:
+        password = _get_password(cfg)
+    except (EOFError, KeyboardInterrupt):
+        err_console.print("Zrušeno.")
+        conn.close()
+        raise typer.Exit(code=130)
+
+    if not password:
+        err_console.print("Prázdné heslo.")
+        conn.close()
+        raise typer.Exit(code=2)
+
+    try:
+        console.rule("Server snapshot")
+        with open_mailbox(cfg.imap, cfg.imap_user, password) as box:
+            folders = _list_audit_folders(box)
+            server_map = _scan_server_message_ids(box, folders)
+        console.print(f"\n  TOTAL Message-IDs: [bold]{len(server_map)}[/bold]")
+
+        console.rule("Plánování přesunů")
+        db_rows = _load_db_classifications(conn)
+        last_actions = _load_last_actions(conn)
+
+        queue: list[dict] = []
+        no_op = 0
+        not_on_server = 0
+        no_predicted = 0
+        skip_user_manual = 0
+        skip_no_downgrade = 0
+
+        for r in db_rows:
+            predicted = _category_to_target(cfg, r["category"], r["subcategory"])
+            if not predicted:
+                no_predicted += 1
+                continue
+            mid = _normalize_message_id(r["message_id"])
+            if not mid or mid not in server_map:
+                not_on_server += 1
+                continue
+            current_folder, current_uid = server_map[mid]
+            if current_folder == predicted:
+                no_op += 1
+                continue
+
+            # No downgrade: nepřesouvat ze specifické složky do HITL
+            if predicted == hitl_folder and current_folder != "INBOX":
+                skip_no_downgrade += 1
+                continue
+
+            last_target = last_actions.get(int(r["id"]))
+
+            if current_folder == "INBOX":
+                # Standard apply — nikdy nepřesunut
+                pass
+            elif last_target is None:
+                # User ručně přesunul z INBOX bez applye
+                skip_user_manual += 1
+                continue
+            elif last_target != current_folder:
+                # User ručně přesunul po applye (z aplikované složky jinam)
+                skip_user_manual += 1
+                continue
+            # else: state drift (last_target == current_folder ≠ predicted) → queue
+
+            queue.append({
+                "db_id": int(r["id"]),
+                "msg_id": mid,
+                "from": r["from_addr"],
+                "current": current_folder,
+                "uid": current_uid,
+                "predicted": predicted,
+            })
+
+        console.rule("Souhrn plánu")
+        console.print(f"NO-OP (už správně):     [green]{no_op}[/green]")
+        console.print(f"K přesunu:              [yellow]{len(queue)}[/yellow]")
+        console.print(f"Skip — user manual:     {skip_user_manual}")
+        console.print(f"Skip — no downgrade:    {skip_no_downgrade}")
+        console.print(f"Není na serveru:        {not_on_server}")
+        console.print(f"Bez target (skip):      {no_predicted}")
+
+        from collections import Counter
+        breakdown = Counter((q["current"], q["predicted"]) for q in queue)
+        console.rule("Breakdown current → predicted (top 30)")
+        for (cur, pred), n in breakdown.most_common(30):
+            console.print(f"  {n:>5d}  {cur:35s} → {pred}")
+
+        if plan_output:
+            plan_output.write_text(
+                json.dumps(queue, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            console.print(f"\nPlán uložen do [bold]{plan_output}[/bold]")
+
+        if not do_apply:
+            console.print("\n[dim]Dry-run — nic neprovedeno. Spusť s --apply.[/dim]")
+            return
+
+        if not queue:
+            console.print("[green]Žádné přesuny — hotovo.[/green]")
+            return
+
+        # --- APPLY ---
+        console.rule(f"APPLY — {len(queue)} přesunů")
+
+        # Group by source folder pro efektivitu (jeden SET na složku)
+        by_source: dict[str, list[dict]] = {}
+        for q in queue:
+            by_source.setdefault(q["current"], []).append(q)
+
+        moved = 0
+        errors = 0
+        not_found = 0
+
+        with open_mailbox(cfg.imap, cfg.imap_user, password) as box:
+            for src_folder in sorted(by_source.keys()):
+                items = by_source[src_folder]
+                console.print(f"\n[bold]Source:[/bold] {src_folder} ({len(items)} mailů)")
+                try:
+                    box.folder.set(src_folder)
+                except Exception as exc:
+                    err_console.print(f"  ! SET selhal: {exc}")
+                    errors += len(items)
+                    continue
+
+                for i, q in enumerate(items, 1):
+                    try:
+                        # Re-verify UID dle Message-ID (UID se mohlo mezitím změnit)
+                        found = list(box.fetch(
+                            IMAP_AND(header=IMAP_H("Message-ID", q["msg_id"])),
+                            mark_seen=False, bulk=False, limit=1,
+                        ))
+                        if not found:
+                            not_found += 1
+                            with db.transaction(conn):
+                                db.record_action(
+                                    conn, message_id=q["db_id"], action_type="reapply",
+                                    target=q["predicted"], dry_run=False, success=False,
+                                    error="not found in src by Message-ID",
+                                )
+                            continue
+                        uid = found[0].uid
+                        box.copy([uid], q["predicted"])
+                        box.flag([uid], [MailMessageFlags.SEEN], True)
+                        box.delete([uid])
+                        with db.transaction(conn):
+                            db.record_action(
+                                conn, message_id=q["db_id"], action_type="reapply",
+                                target=q["predicted"], dry_run=False, success=True,
+                            )
+                        moved += 1
+                        if verbose or i % 50 == 0 or i == len(items):
+                            console.print(f"  [{i}/{len(items)}] moved so far: {moved}")
+                    except Exception as exc:
+                        err_msg = str(exc)[:200]
+                        err_console.print(f"  ! msg {q['db_id']}: {err_msg}")
+                        with db.transaction(conn):
+                            db.record_action(
+                                conn, message_id=q["db_id"], action_type="reapply",
+                                target=q["predicted"], dry_run=False, success=False,
+                                error=err_msg,
+                            )
+                        errors += 1
+
+        console.rule("Výsledek reapply")
+        console.print(f"Přesunuto:    [green]{moved}[/green]")
+        console.print(f"Nenalezeno:   [yellow]{not_found}[/yellow]")
+        console.print(f"Chyb:         [red]{errors}[/red]")
+        if errors:
+            raise typer.Exit(code=1)
+    except MailboxLoginError:
+        err_console.print("IMAP login selhal.")
+        raise typer.Exit(code=1)
+    finally:
+        password = "x" * len(password) if password else ""
+        del password
+        conn.close()
 
 
 def main() -> None:

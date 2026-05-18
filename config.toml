@@ -3,6 +3,7 @@ host = "imap.1pmail.cz"
 port = 993
 use_ssl = true
 inbox = "INBOX"
+sent_folder = "Sent"
 # Složky, ze kterých se čte při `fetch` (pořadí = priorita).
 # Junk je důležitý — slouží jako trénovací data pro spam klasifikaci.
 fetch_folders = ["INBOX", "Junk"]
@@ -11,11 +12,26 @@ fetch_folders = ["INBOX", "Junk"]
 # Cílové složky pro Fázi 4 (MOVE s --apply). Top-level _mail.* (mimo INBOX).
 # Pozn.: 1pmail.cz IMAP používá hierarchický delimiter "." (ne "/").
 invoices         = "_mail.Účetní"
-unimportant      = "_mail.Archive"
+clients          = "_mail.klienti"
+domeny           = "_mail.domeny"
+interni          = "_mail.interni"
+rentals          = "_mail.Najmy"
+firma_budova     = "_mail.Firma-budova"
+unimportant      = "_mail.unimportant"
 important_review = "_mail.Review"
 unsure           = "_mail.HITL"
 # Zjevný spam — server-side spam složka (UŽ existuje, nevyrábíme).
 spam             = "Junk"
+
+# Subkategorie pro `unimportant` (v2-subcategories-2026-05-12).
+# Mapování (category, subcategory) → klíč je v src/zdenda_mail/rules.py::TARGET_KEYS.
+unimportant_banks   = "_mail.unimportant.banks"
+unimportant_energie = "_mail.unimportant.energie"
+unimportant_eshops  = "_mail.unimportant.eshops"
+unimportant_develop = "_mail.unimportant.develop"
+unimportant_sw      = "_mail.unimportant.sw"
+unimportant_doprava = "_mail.unimportant.doprava"
+unimportant_komora  = "_mail.unimportant.komora"
 
 [batch]
 default_size = 50

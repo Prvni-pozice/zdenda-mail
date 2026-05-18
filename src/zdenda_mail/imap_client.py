@@ -80,6 +80,23 @@ def _parse_references(header_value: str | None) -> list[str]:
     return [tok for tok in header_value.split() if tok]
 
 
+def clean_message_id(raw: "str | tuple | list | None") -> str | None:
+    """Vrátí Message-ID bez RFC 5322 zalomení (CR/LF + folding mezery).
+
+    `imap_tools` vrací hlavičky často foldované — hodnota pak obsahuje CR/LF.
+    `email.message` takovou hodnotu při sestavování odpovědi odmítne
+    (`Header values may not contain linefeed`). Volej HNED při extrakci
+    Message-ID, ať se zalomená hodnota nikam dál nedostane (In-Reply-To,
+    References). Message-ID nemá vnitřní mezery, takže smazat všechen
+    whitespace je bezpečné.
+    """
+    if isinstance(raw, (tuple, list)):
+        raw = raw[0] if raw else None
+    if not raw:
+        return None
+    return "".join(str(raw).split())
+
+
 def fetch_unseen(
     box: MailBox | MailBoxUnencrypted,
     *,
@@ -126,6 +143,51 @@ def fetch_unseen(
 
     raw_msgs.sort(key=_sort_key, reverse=not oldest_first)
     raw_msgs = raw_msgs[:limit]
+
+    return [_to_mail_message(m, folder) for m in raw_msgs]
+
+
+def fetch_all_from_folder(
+    box: MailBox | MailBoxUnencrypted,
+    *,
+    folder: str,
+    skip_uids: set[int] | None = None,
+    oldest_first: bool = True,
+    limit: int | None = None,
+) -> list[MailMessage]:
+    """Stáhne VŠECHNY zprávy z `folder` (bez filtru seen/unseen).
+
+    Vhodné pro odeslané maily. `skip_uids` zajišťuje idempotenci (přeskočí
+    UID už uložená v DB). `limit` omezí počet vrácených zpráv (per run).
+    """
+    from datetime import datetime, timezone
+
+    skip = skip_uids or set()
+    box.folder.set(folder)
+
+    raw_msgs: list = []
+    for msg in box.fetch("ALL", mark_seen=False, bulk=True):
+        if msg.uid is None:
+            continue
+        try:
+            uid = int(msg.uid)
+        except ValueError:
+            continue
+        if uid in skip:
+            continue
+        raw_msgs.append(msg)
+
+    def _sort_key(m) -> tuple[int, datetime]:  # type: ignore[no-untyped-def]
+        d = m.date
+        if d is None:
+            return (1, datetime.min.replace(tzinfo=timezone.utc))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return (0, d)
+
+    raw_msgs.sort(key=_sort_key, reverse=not oldest_first)
+    if limit is not None:
+        raw_msgs = raw_msgs[:limit]
 
     return [_to_mail_message(m, folder) for m in raw_msgs]
 

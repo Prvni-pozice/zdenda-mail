@@ -14,6 +14,7 @@ class ImapConfig(BaseModel):
     port: int = 993
     use_ssl: bool = True
     inbox: str = "INBOX"
+    sent_folder: str = "Sent"
     # Složky, ze kterých se čte při `fetch` (defaultně jen `inbox`).
     # Junk se přidává proto, aby spam fungoval jako trénovací data.
     fetch_folders: list[str] = Field(default_factory=lambda: ["INBOX"])
@@ -21,10 +22,23 @@ class ImapConfig(BaseModel):
 
 class TargetsConfig(BaseModel):
     invoices: str
+    clients: str | None = None  # v3-clients-2026-05-13
+    domeny: str | None = None  # v6-domeny-2026-05-17
+    interni: str | None = None  # v6-interni-2026-05-17
+    rentals: str | None = None  # v4-rental-firma-2026-05-14
+    firma_budova: str | None = None  # v4-rental-firma-2026-05-14
     unimportant: str
     important_review: str
     unsure: str
     spam: str = "Junk"
+    # Subkategorie unimportant (v2-subcategories-2026-05-12)
+    unimportant_banks: str | None = None
+    unimportant_energie: str | None = None
+    unimportant_eshops: str | None = None
+    unimportant_develop: str | None = None
+    unimportant_sw: str | None = None
+    unimportant_doprava: str | None = None
+    unimportant_komora: str | None = None
 
 
 class BatchConfig(BaseModel):
@@ -42,8 +56,9 @@ class Config(BaseModel):
     batch: BatchConfig
     db: DbConfig
 
-    # Runtime — z .env (NIKDY heslo)
+    # Runtime — z .env
     imap_user: str = Field(default="")
+    imap_pass: str = Field(default="")
 
 
 def _project_root() -> Path:
@@ -70,6 +85,7 @@ def load_config(toml_path: str | Path | None = None) -> Config:
 
     load_dotenv(_project_root() / ".env", override=False)
     imap_user = os.getenv("IMAP_USER", "")
+    imap_pass = os.getenv("IMAP_PASS", "")
 
     return Config(
         imap=ImapConfig(**data["imap"]),
@@ -77,4 +93,5 @@ def load_config(toml_path: str | Path | None = None) -> Config:
         batch=BatchConfig(**data["batch"]),
         db=DbConfig(**data["db"]),
         imap_user=imap_user,
+        imap_pass=imap_pass,
     )
