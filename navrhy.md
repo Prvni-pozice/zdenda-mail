@@ -80,6 +80,16 @@ než N dní → eskalace do denního přehledu.
 
 ---
 
+## C) Automatizace běhu (issue z 2026-05-29)
+
+Cíl: hodinový sort nově příchozích + týdenní persona refresh, bez ručního spouštění.
+
+**Hodinový sort** (proveditelné dnes): cron → `zdenda-mail fetch` + apply (rule-based, žádný LLM). Heslo už v `.env`, neinteraktivní běh funguje. Pokryje rutinu (newslettery, doménové notifikace, klienty na whitelistu). Skutečně ambiguous maily půjdou do HITL/Review jako dnes.
+
+**Týdenní persona refresh** (potřebuje LLM): `fetch-sent` + obsahová analýza odeslaných za posledních N dní → update `persona.md` + memory `email-writing-style`. Buď naplánovaná Claude Code session (skill `/schedule`), nebo akceptace pay-per-token API (proti původnímu designu).
+
+**Plný obsahový triage** příchozích (LLM místo jen pravidel) — má smysl spustit ve stejném týdenním passu, ne hodinově (cena/čas).
+
 ## Doporučené pořadí
 
 1. `message_tasks` tabulka + `delegate` a denní přehled „co dlužím / po termínu".
