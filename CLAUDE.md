@@ -81,7 +81,7 @@ V CLAUDE.md projektu (sekce níže) bude klasifikační instrukce — definice k
 
 ## Klasifikační instrukce
 
-Aktuální verze: **`v5-newsletter-cleanup-2026-05-14`** (kanonický zdroj: `src/zdenda_mail/rules.py`, funkce `classify(item)`).
+Aktuální verze: **`v7.1-scam-keyword-tuning-2026-06-14`** (kanonický zdroj: `src/zdenda_mail/rules.py`, funkce `classify(item)`).
 
 Historie verzí:
 - `v1-conservative-2026-05-11` (text v `classifier.py` jako `PROMPT_V1`)
@@ -90,13 +90,15 @@ Historie verzí:
 - `v4-rental-firma-2026-05-14` — kategorie `rental` (`_mail.Najmy`) a `firma_budova` (`_mail.Firma-budova`); přesun `hkpe.cz`/`hkjihlava.cz` z CLIENT_DOMAINS/IMPORTANT_DOMAINS → KOMORA_DOMAINS; cleanup duplicit (`vnd.cz` byl v obou CLIENT i IMPORTANT); řada sender corrections (DJI, Loxone, businessprofile-google, families-noreply-google, support@ppl.cz, airbnb discover přesunuty mezi kategoriemi).
 - `v5-newsletter-cleanup-2026-05-14` — vytřízdění 1019 nepřečtených HITL/Review. Nový "Exact-match overrides" blok v `classify()` (běží před IMPORTANT_DOMAINS suffix-matchem) — fix kolizí `prvni-pozice.com`, `collabim.cz`, `edc-cr.cz`. Rozšířené patterny: `egd.cz`/`dis.edc-cr.cz` (energie), `fio.cz` (banks), `airbnb`/`rcobchod`/`e-flypgs`/`cdkeysales` (eshops), `8020ai.co`/`mindvalley`/`deepstash`/`onedrive`/`capterra`/`complianz`/`claude.com`/`promotime`/`nascar`/`trademedia` (sw), `ppl.cz`/`balikovna.cz` (doprava). Nové spam patterny: `firezink.de`, `hymedimachinery.com`, `nextgroup.ge`. Aplikace: 587 přesunů, 0 chyb (1m 46s IMAP, 1.2s reclassify pro 8917 zpráv).
 - `v6-domeny-interni-retriage-2026-05-17` — nové kategorie `domeny` (`_mail.domeny`, notifikace registrátora `nic.cz`) a `interni` (`_mail.interni`, interní pošta `prvni-pozice.com`/`michalmartinek.cz`); re-triage složky Review (1176→419, 757 přesunů); `ortex.cz`/`karlova-pekarna.cz` přesunuty z IMPORTANT_DOMAINS do CLIENT_DOMAINS. Migrace `003`: `messages.current_folder/current_uid` (kde mail teď reálně leží) + tabulka `message_analysis` (obsahová vrstva — relationship, intent, summary, needs_reply, suggested_folder). Návrhy dalších kroků v `navrhy.md`.
+- `v7-legit-before-spam-2026-06-14` — **přeřazení `classify()`**: známé legit matchery (invoice/rental/client/domeny/important/unimportant) běží nyní PŘED spam heuristikami (hard-TLD, scam keywords, cold patterns). Důvod: legit odesílatelé na „spam" TLD (`.online`) nebo se slovem v subjectu (`půjčka`) padali falešně do spamu. Nahoře zůstává jen nezaměnitelný scam (firebaseapp, czech-fake `.eu`). Nový `DOMENY_DOMAINS` set (zobecnění `nic.cz` → + WEDOS `wedos.cz`/`vedos.cz`/`wedos.online` jako dodavatel domén/serverů). Přidáno: `mathesio.cz`→IMPORTANT (byznys partner), `orlen.pl`/`charge.orlen.pl`→ENERGIE, `voitech.academy`→SW.
+- `v7.1-scam-keyword-tuning-2026-06-14` — fix dalších false-positives nalezených při triáži spamu napříč INBOX: **odstraněno `"půjčk"` ze SCAM_SUBJECTS** (Zdeněk provozuje půjčovnu aut — „půjčení auta" je legit slovník, chytalo to reálné poptávky na pronájem Tesly z `gmail.com`). Whitelist legit transakčních odesílatelů chycených keywordy `verify your email`/`your document`: `apple.com`/`workos.com`/`workos-mail.com`→DEVELOP, `smatrics.com`→ENERGIE, `nuerburgring.de`→ESHOPS, `uzdubu.cz`→UNIMPORTANT (lokální kulturní newsletter). Aplikace: 591 INBOX spam → Junk, 0 chyb.
 
 ### Kategorie + subkategorie
 
 - `invoice` → `_mail.Účetní` — JAKÝKOLIV doklad za platbu (i zálohová/proforma, výzva, upomínka).
 - `rental` → `_mail.Najmy` — pošta od nájemníků a správce nemovitosti (`bytservis-ji.cz`, `peta9870@email.cz`). Kontroluje se PO invoice a PŘED client. (v4)
 - `firma_budova` → `_mail.Firma-budova` — cenové nabídky pro firmu/budovu (`fabrego.cz`, `flexibox.cz`, `zasklej.to`). Kontroluje se po rental, před client. (v4)
-- `domeny` → `_mail.domeny` — doménové notifikace registrátora (`nic.cz`): prodloužení, zrušení, změny, autorizační info. Automatické, ne osobní korespondence. (v6)
+- `domeny` → `_mail.domeny` — notifikace registrátora/hostingu (`nic.cz`, WEDOS `wedos.cz`/`vedos.cz`/`wedos.online`): prodloužení, zrušení, monitoring serverů, autorizační info. Automatické, ne osobní korespondence. (v6, zobecněno na `DOMENY_DOMAINS` ve v7)
 - `interni` → `_mail.interni` — interní firemní pošta (`prvni-pozice.com`, `michalmartinek.cz`) — komunikace týmu. (v6)
 - `client` → `_mail.klienti` — mail od některé z ~532 klientských domén v `CLIENT_DOMAINS` (suffix-match). Kontroluje se PO `invoice/rental/firma_budova` a PŘED `important` — faktura od klienta jde do Účetní (reconciliation), ostatní pošta od klienta přeskakuje Review queue a jde rovnou do klientů.
 - `important` → `_mail.Review` — vyžaduje reakci majitele (zákazník, dodavatel, banka, úřad, doména/hosting, osobní).

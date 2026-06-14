@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-PROMPT_VERSION = "v6-domeny-interni-retriage-2026-05-17"
+PROMPT_VERSION = "v7.1-scam-keyword-tuning-2026-06-14"
 
 
 @dataclass
@@ -237,6 +237,7 @@ IMPORTANT_DOMAINS = {
     "ji-hlava.cz",  # MFDF
     "collabim.cz",  # SEO trénink — szpuk
     "compic.cz",    # AI Monday — kvido
+    "mathesio.cz",  # v7: byznys partner — WMS nasazení, reporty První pozice
 }
 
 IMPORTANT_FROM_EXACT = {
@@ -279,6 +280,17 @@ IMPORTANT_FROM_EXACT = {
     "hrdlickova.martina@karlova-pekarna.cz",
     # Energetická data — automated státní notifikace, ale ponecháno v Review:
     # ms21.mssf.cz (depeše MS2021+)
+}
+
+
+# ============================================================================
+# DOMENY — registrátor / hosting / servery (automatické notifikace) → _mail.domeny
+# ============================================================================
+# v7: dříve jen nic.cz (special-case v IMPORTANT bloku). Zobecněno na set —
+# WEDOS je dodavatel domén a serverů (wedos.cz/vedos.cz/wedos.online).
+DOMENY_DOMAINS = {
+    "nic.cz",
+    "wedos.cz", "vedos.cz", "wedos.online",
 }
 
 
@@ -347,6 +359,10 @@ ENERGIE_DOMAINS = {
     # v5
     "egd.cz", "eg-d.cz",
     "dis.edc-cr.cz",
+    # v7: ORLEN nabíjení (.pl — bez whitelistu padalo do soft-spam TLD)
+    "orlen.pl", "charge.orlen.pl",
+    # v7.1: SMATRICS EV nabíjení (chyceno scam-keyword „verify your email")
+    "smatrics.com",
 }
 
 
@@ -400,6 +416,8 @@ ESHOPS_FROM_EXACT = {
     "kontakt@mbank.cz",  # marketing variant
 }
 ESHOPS_DOMAINS = {
+    # v7.1: legit objednávky/účet (.de soft-TLD) — okruh Nürburgring (auta)
+    "nuerburgring.de",
     # v5 přírůstky
     "mailing.rcobchod.cz", "rcobchod.cz",
     "e-flypgs.com",
@@ -488,6 +506,8 @@ DEVELOP_FROM_EXACT = {
     "newsletter@chargepoint.com",
 }
 DEVELOP_DOMAINS = {
+    # v7.1: legit dev/účet — Apple Developer, WorkOS (chyceno scam-keyword „verify"/„your document")
+    "apple.com", "workos-mail.com", "workos.com",
     "docker.com",
     "discord.com",
     "github.com",
@@ -593,6 +613,8 @@ SW_FROM_EXACT = {
     "info@firmy.cz",  # already eshops
 }
 SW_DOMAINS = {
+    # v7: legitimní přihlášený odběr (newsletter o autech) — ne důležité, ne spam
+    "voitech.academy",
     # v5 přírůstky
     "8020ai.co",
     "mailer.mindvalley.com", "mindvalley.com",
@@ -774,6 +796,8 @@ UNIMPORTANT_FROM_EXACT = {
     "no-reply@autodesk.com",
 }
 UNIMPORTANT_DOMAINS = {
+    # v7.1: lokální kulturní newsletter (bítešský festival, koncerty) — chyceno cold-B2B pattern
+    "uzdubu.cz",
     "inizio.cz", "jarekmikes.com", "novinky.jarekmikes.com",
     "novinky.jaromirotava.cz", "jaromirotava.cz",
     "ivotoman.cz", "novinky.ivotoman.cz",
@@ -900,7 +924,9 @@ SOFT_SPAM_WHITELIST_DOMAINS = {
 # Subject klíčová slova pro scam
 SCAM_SUBJECTS = (
     "powerball", "powerbal", "nigerijsk", "jackpot",
-    "půjčk", "investiční večeř", "soukromá investiční",
+    # v7.1: „půjčk" ODSTRANĚNO — Zdeněk provozuje půjčovnu aut, „půjčení auta" je legit
+    # slovník (chytalo to reálné poptávky na pronájem Tesly z gmail.com).
+    "investiční večeř", "soukromá investiční",
     "pink salt", "fix your teeth", "erection switch",
     "banned:", "bizarre indian", "shrink your prostate",
     "tinnitus is killing", "flushes out fat",
@@ -956,20 +982,23 @@ def _domain_match(domain: str, allowed: set[str]) -> bool:
 def classify(item: dict) -> RuleResult:
     """Klasifikuj jeden mail (dict s `folder`, `from_addr`, `subject`, `body_text`/`snippet`).
 
-    Pořadí kontrol:
+    Pořadí kontrol (v7: legit matchery běží PŘED spam heuristikami):
       1. Junk-source → spam
-      2. Hard scam patterns (firebaseapp, czech-fake .eu, .za.com, .shop, .buzz, ...)
-      3. Subject scam keywords
-      4. INVOICE matchers (exact + conditional)
-      5. RENTAL → category=rental (po INVOICE, před CLIENT)
-      6. FIRMA_BUDOVA → category=firma_budova
-      7. CLIENT_DOMAINS → category=client
-      8. IMPORTANT domain / exact + conditional
+      2. Jednoznačný scam, který nelze whitelistovat (firebaseapp, czech-fake .eu)
+      --- LEGIT MATCHERY (známý odesílatel vždy přebije heuristiku) ---
+      3. INVOICE matchers (exact + conditional)
+      4. RENTAL → category=rental
+      5. FIRMA_BUDOVA → category=firma_budova
+      6. CLIENT_DOMAINS → category=client
+      7. DOMENY (nic.cz, WEDOS) → category=domeny
+      8. exact overrides + IMPORTANT domain/exact + conditional ČS
       9. UNIMPORTANT sub-kategorie (banks → energie → eshops → develop → sw → doprava → komora)
      10. UNIMPORTANT (generic newsletter)
-     11. COLD_SPAM_DOMAINS_RE + firstname.lastname patterns
-     12. Soft-spam TLDs (.pl/.ru/.ua/.cn/.tw/.de) → přísnější kontrola
-     13. Default → unsure
+      --- SPAM HEURISTIKY (jen pro neznámé odesílatele) ---
+     11. Hard spam TLDs (.shop/.buzz/.online/...) + subject scam keywords
+     12. COLD_SPAM_DOMAINS_RE + firstname.lastname + gibberish patterns
+     13. Soft-spam TLDs (.pl/.ru/.ua/.cn/.tw/.de) → přísnější kontrola
+     14. Default → unsure
     """
     folder = item.get("folder") or ""
     from_addr = (item.get("from_addr") or "").strip().lower()
@@ -991,15 +1020,8 @@ def classify(item: dict) -> RuleResult:
     if domain in CZECH_FAKE_EU_DOMAINS:
         return RuleResult("spam", None, 0.95, "marketing", "Czech-fake product .eu spam")
 
-    if any(domain.endswith(t) for t in SPAM_TLDS_HARD):
-        # Whitelist legit shops
-        if not any(w in from_addr for w in SHOP_TLD_WHITELIST):
-            return RuleResult("spam", None, 0.92, "marketing", f"spam TLD: {domain.rsplit('.', 1)[-1]}")
-
-    # 3) Subject scam keywords
-    for kw in SCAM_SUBJECTS:
-        if kw in text:
-            return RuleResult("spam", None, 0.93, "marketing", f"scam keyword: {kw}")
+    # v7: SPAM_TLDS_HARD a SCAM_SUBJECTS přesunuty NÍŽE (za legit matchery),
+    # aby známí legit odesílatelé (wedos.online, mbank „půjčka") nepadali do spamu.
 
     # 4) INVOICE
     if from_addr in INVOICE_FROM_EXACT:
@@ -1036,6 +1058,10 @@ def classify(item: dict) -> RuleResult:
     # 7) CLIENT — známé klientské domény (po INVOICE, před IMPORTANT)
     if domain in CLIENT_DOMAINS or _domain_match(domain, CLIENT_DOMAINS):
         return RuleResult("client", None, 0.92, "customer", f"client domain: {domain}")
+
+    # 7.4) DOMENY — registrátor / hosting / servery (nic.cz, WEDOS) → _mail.domeny
+    if domain in DOMENY_DOMAINS or _domain_match(domain, DOMENY_DOMAINS):
+        return RuleResult("domeny", None, 0.95, "service", f"doménová/hosting notifikace: {domain}")
 
     # 7.5) Exact-match overrides PŘED domain-based IMPORTANT
     # Důvod: některé exact addresses (dalibor@collabim.cz, mailer-daemon@mail.prvni-pozice.com)
@@ -1097,6 +1123,17 @@ def classify(item: dict) -> RuleResult:
     # 7) Generic UNIMPORTANT
     if from_addr in UNIMPORTANT_FROM_EXACT or _domain_match(domain, UNIMPORTANT_DOMAINS):
         return RuleResult("unimportant", None, 0.88, "marketing", "newsletter generic")
+
+    # ── SPAM HEURISTIKY (běží AŽ po legit matcherech — jen pro neznámé odesílatele) ──
+    # v7: hard-TLD + scam-subjects sem přesunuty z horní části classify(),
+    # aby legit odesílatelé na "spam" TLD (.online) nebo se slovem "půjčka" prošli.
+    if any(domain.endswith(t) for t in SPAM_TLDS_HARD):
+        if not any(w in from_addr for w in SHOP_TLD_WHITELIST):
+            return RuleResult("spam", None, 0.92, "marketing", f"spam TLD: {domain.rsplit('.', 1)[-1]}")
+
+    for kw in SCAM_SUBJECTS:
+        if kw in text:
+            return RuleResult("spam", None, 0.93, "marketing", f"scam keyword: {kw}")
 
     # 8) COLD SPAM patterns
     if COLD_SPAM_DOMAINS_RE.search(from_addr):
