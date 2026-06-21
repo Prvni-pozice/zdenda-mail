@@ -25,6 +25,10 @@ wheels/
 # Stažené přílohy (faktury) — drží se mimo Git
 invoices/
 
+# Transientní dávky pro LLM re-triage + generované reporty
+scripts/unsure_batches/
+open_loops.md
+
 # Pytest / coverage
 .pytest_cache/
 .coverage

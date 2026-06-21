@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-PROMPT_VERSION = "v7.1-scam-keyword-tuning-2026-06-14"
+PROMPT_VERSION = "v7.2-hitl-retriage-2026-06-21"
 
 
 @dataclass
@@ -969,6 +969,53 @@ TARGET_KEYS = {
 }
 
 
+# ============================================================================
+# v7.2 — re-triage HITL 2026-06-21
+# Doplnění patternů z analýzy složky _mail.HITL (+ zpětná vazba uživatele).
+# Forma: sjednocení existujících setů in-place — celá změna na jednom místě.
+# ============================================================================
+
+# Pracovní / byznys kontakty → important (vyžadují reakci)
+IMPORTANT_DOMAINS |= {
+    "mathesio.com",       # byznys partner (.com varianta mathesio.cz) — WMS/Diton
+    "adw.cz",             # ADW FOOD — zákazník, web/ERP support requesty
+    "stampi.cz",          # IT integrace (SMTP / Cezar / VND FTP)
+    "inexia.cz",          # web projekt (WEB TLC)
+    "generaliceska.cz",   # pojišťovací poradce + pojistné smlouvy
+    "uschovna.cz",        # doručení pracovních souborů (akční)
+    "80edays.com",        # 80edays / Teslou kolem světa — logistika projektu
+}
+
+# Newslettery a SaaS notifikace → unimportant/sw
+SW_DOMAINS |= {
+    "theinformation.com", "shopcamp.cz", "purple-trading.com",
+    "grada.cz", "beehiiv.com", "smba.cz", "ostendorf-osma.cz",
+    "voitechacademy.com", "milionchvilek.cz",
+}
+
+# Energie
+ENERGIE_DOMAINS |= {"centropol.cz"}
+
+# Dev nástroje
+DEVELOP_DOMAINS |= {"supabase.com", "n8n.io"}
+
+# Eshopy / marketing eshopů
+ESHOPS_DOMAINS |= {"bazos.cz", "steampowered.com", "print.cz"}
+
+# Doprava / zásilky
+DOPRAVA_DOMAINS |= {"cpost.cz", "gls-czech.com"}
+
+# Brokeři / finance
+BANKS_DOMAINS |= {"trading212.com"}
+
+# Cold-B2B / scam domény z HITL → spam (žádný legit matcher je nechytá)
+EXTRA_SPAM_DOMAINS = {
+    "serptiom.com.es", "theinsurancequoter.com", "networkada.it",
+    "digimank.homes", "servomotor.ltd", "transport10.com",
+    "smilemakerscollection.com", "qronge.com",
+}
+
+
 def _domain_match(domain: str, allowed: set[str]) -> bool:
     """Doména `foo.bar.com` matchne `bar.com` i `foo.bar.com`."""
     if domain in allowed:
@@ -1046,6 +1093,17 @@ def classify(item: dict) -> RuleResult:
         if "objednávka" in s or "zaplacení" in s:
             return RuleResult("invoice", None, 0.92, "supplier", "Growjob platba")
         return RuleResult("unimportant", "sw", 0.85, "marketing", "Growjob newsletter")
+
+    # v7.2 conditional — Vodafone (vyúčtování = invoice, jinak marketing)
+    if domain in ("vodafone.cz", "vodafone.com"):
+        if "vyúčtování" in s or "splatnost" in s or "faktur" in s:
+            return RuleResult("invoice", None, 0.9, "supplier", "Vodafone vyúčtování")
+        return RuleResult("unimportant", "sw", 0.85, "marketing", "Vodafone marketing")
+    # v7.2 conditional — Apple e-mail (faktura/účtenka = invoice, jinak notifikace)
+    if domain == "email.apple.com":
+        if any(w in s for w in ("faktura", "účtenka", "receipt", "invoice")):
+            return RuleResult("invoice", None, 0.9, "supplier", "Apple faktura/účtenka")
+        return RuleResult("unimportant", "sw", 0.85, "marketing", "Apple notifikace/marketing")
 
     # 5) RENTAL — nájemníci a správa nemovitostí (po INVOICE, před CLIENT)
     if from_addr in RENTAL_FROM_EXACT or _domain_match(domain, RENTAL_DOMAINS):
@@ -1127,6 +1185,11 @@ def classify(item: dict) -> RuleResult:
     # ── SPAM HEURISTIKY (běží AŽ po legit matcherech — jen pro neznámé odesílatele) ──
     # v7: hard-TLD + scam-subjects sem přesunuty z horní části classify(),
     # aby legit odesílatelé na "spam" TLD (.online) nebo se slovem "půjčka" prošli.
+
+    # v7.2: explicitní cold-B2B / scam domény z HITL analýzy
+    if domain in EXTRA_SPAM_DOMAINS or _domain_match(domain, EXTRA_SPAM_DOMAINS):
+        return RuleResult("spam", None, 0.9, "marketing", f"HITL spam domain: {domain}")
+
     if any(domain.endswith(t) for t in SPAM_TLDS_HARD):
         if not any(w in from_addr for w in SHOP_TLD_WHITELIST):
             return RuleResult("spam", None, 0.92, "marketing", f"spam TLD: {domain.rsplit('.', 1)[-1]}")
