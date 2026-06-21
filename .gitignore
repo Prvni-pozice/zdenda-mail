@@ -33,3 +33,6 @@ open_loops.md
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Transientní reapply plán
+reapply_plan.json
